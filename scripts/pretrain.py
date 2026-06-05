@@ -311,8 +311,12 @@ def main() -> int:
                    if amp_dtype is not None else _Null())
             with ctx:
                 logits, value = model(planes)
-                # L2 via optimizer weight_decay -> c=0 here to avoid double count.
-                loss = az_loss(logits, value, pi, z, mask, c=0.0, model=None)
+                # 修复:原 az_loss 的 mask 只含目标这一个着法 → 策略项恒为0(policy头不学)。
+                # 改为对全 8100 维做(软)交叉熵:模型学会在所有动作里把目标排最高。
+                logp = torch.log_softmax(logits.float(), dim=1)
+                policy_loss = -(pi.float() * logp).sum(dim=1).mean()
+                value_loss = torch.nn.functional.mse_loss(value.float().squeeze(1), z.float())
+                loss = value_loss + policy_loss
 
             if scaler.is_enabled():
                 scaler.scale(loss).backward()

@@ -1,0 +1,57 @@
+# 模型权重/checkpoint
+*.pt
+*.pth
+*.ckpt
+*.onnx
+*.engine
+checkpoints/
+weights/
+
+# 数据/棋谱/自对弈样本
+data/
+*.pgn
+*.sgf
+*.npy
+*.npz
+replay_buffer/
+selfplay/
+
+# 日志
+logs/
+runs/
+wandb/
+*.log
+
+# Python / uv
+.venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+_skbuild/
+.ipynb_checkpoints/
+
+# C++ 构建产物
+cpp/build/
+*.o
+*.a
+*.so
+CMakeCache.txt
+CMakeFiles/
+
+# 编辑器/系统
+.vscode/
+.idea/
+.DS_Store
+*.swp
+
+# 第三方克隆仓库（各自带 .git，不入库）
+third_party/
+
+# Claude Code 本地配置（含本机权限，不入库）
+.claude/settings.local.json
+
+# 秘密
+.env
+*.token

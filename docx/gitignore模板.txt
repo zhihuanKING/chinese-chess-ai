@@ -1,0 +1,61 @@
+# ===== 复制本文件为项目根目录的 .gitignore =====
+# cp docx/gitignore模板.txt .gitignore
+
+# --- 模型权重 / checkpoint（绝对不要进 git，太大）---
+*.pt
+*.pth
+*.ckpt
+*.onnx
+*.engine          # TensorRT
+*.bin
+checkpoints/
+weights/
+best.pt
+
+# --- 数据集 / 棋谱 / 自对弈样本（太大，用网盘或脚本下载）---
+data/
+datasets/
+*.pgn
+*.sgf
+replay_buffer/
+selfplay_samples/
+*.npy
+*.npz
+*.h5
+
+# --- 日志 / 实验输出 ---
+logs/
+runs/             # tensorboard
+wandb/
+*.log
+*.csv             # 若 csv 是必要结果可单独 git add -f
+
+# --- Python ---
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+.ipynb_checkpoints/
+
+# --- C++ 编译产物 ---
+build/
+cmake-build-*/
+*.o
+*.a
+*.so
+*.out
+CMakeCache.txt
+CMakeFiles/
+
+# --- 编辑器 / 系统 ---
+.vscode/
+.idea/
+.DS_Store
+*.swp
+
+# --- 秘密（绝对不能传）---
+*.token
+.env
+secrets*

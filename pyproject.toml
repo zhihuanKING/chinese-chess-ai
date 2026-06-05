@@ -1,0 +1,27 @@
+[build-system]
+requires = ["scikit-build-core>=0.8", "pybind11>=2.12"]
+build-backend = "scikit_build_core.build"
+
+[project]
+name = "xqai"
+version = "0.1.0"
+description = "Chinese Chess (Xiangqi) learning AI — Gumbel-AlphaZero + Alpha-Beta baseline"
+requires-python = ">=3.10"
+dependencies = [
+    "numpy",
+    "torch",
+    "pyyaml",
+    "tqdm",
+    "tensorboard",
+    "matplotlib",
+    "pandas",
+]
+
+[tool.scikit-build]
+# 由 cpp/CMakeLists.txt 编译出 pybind 扩展模块 xqai._xqcore
+cmake.source-dir = "cpp"
+wheel.packages = ["xqai"]
+build-dir = "cpp/build"
+
+[tool.scikit-build.cmake.define]
+CMAKE_BUILD_TYPE = "Release"

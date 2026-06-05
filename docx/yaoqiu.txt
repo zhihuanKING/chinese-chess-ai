@@ -1,0 +1,11 @@
+任务名称：计算博弈棋牌类AI设计 撰写语言：中文
+• 具体内容：通过调研Alpha-Beta搜索、蒙特卡洛树搜索、基于模型的树搜
+索（如MuZero）、深度反事实值最小化（DeepCFR）等相关技术，实现
+一个两人或多人零和博弈的AI，包括但不限于：围棋、中国/国际象棋、
+麻将、德州扑克、斗地主、桥牌、掼蛋、星际争霸、王者荣耀等
+• 参考程序：建议采用C++或Python语言，可参考现有已发表相关论文或者
+GitHub上开源的相关程序，但需在实验报告中说明
+• 已经发表的论文：AlphaGo、AlphaGo Zero、AlphaGo Zero；DeepStack、Libratus、
+Pluribus、AlphaHoldem；SuphX；AlphaStar、OpenAI Five等
+• 评分准则：1）综合考虑所设计AI的效果和效率以及算法创新性；2）课
+程设计报告撰写的规范性和质量以及表述的清晰性   

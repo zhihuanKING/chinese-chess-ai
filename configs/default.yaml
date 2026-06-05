@@ -1,0 +1,48 @@
+# 中国象棋 AI 全局配置（起步值，见 docx/最终实验方案…v2.md）
+network:
+  channels: 128          # 小网起步；中网主力 256
+  blocks: 10             # 小网 10；中网 15；上限 20
+  num_planes: 15
+  action_dim: 8100       # from*90+to 起步；2086 紧凑编码作消融
+
+mcts:
+  planner: puct          # puct（先行） | gumbel（后挂）
+  n_sim_selfplay: 64     # PUCT 50~100；Gumbel 16~32
+  n_sim_eval: 200
+  c_puct: 1.5
+  dirichlet_alpha: 0.2
+  dirichlet_eps: 0.25
+  virtual_loss: 3
+  gumbel_m: 16           # Gumbel 候选数
+  playout_cap_frac: 0.25 # KataGo playout cap randomization：高 playout 比例
+
+selfplay:
+  parallel_games: 1024   # 单 worker 并行对局数（吃满 GPU）
+  workers_per_gpu: 3     # 每卡 worker 进程数
+  temp_moves: 30         # 开局前 N 步温度=1
+  resign_threshold: -0.95
+
+train:
+  batch_size: 2048
+  lr_supervised: 1.0e-3
+  lr_rl: 0.001           # 冷启动微调用低 lr(0.02 会把预训练权重打崩=灾难性遗忘)
+  weight_decay: 1.0e-4
+  precision: bf16
+  export_every: 1500     # 每 K 步导出 candidate
+  gating_games: 100
+  gating_winrate: 0.55
+
+replay:
+  capacity: 2000000      # 最大 5000000
+  dir: /dev/shm/xqai_replay
+  recent_weight: true
+  mirror_augment: true
+
+distributed:
+  learner_gpus: [0, 1]   # 独享整机：2 训练
+  selfplay_gpus: [2, 3, 4, 5, 6, 7]  # 6 自对弈
+
+paths:
+  data: /mnt/nvme3n1/gameTheory/data
+  checkpoints: /mnt/nvme3n1/gameTheory/checkpoints
+  logs: /mnt/nvme3n1/gameTheory/logs

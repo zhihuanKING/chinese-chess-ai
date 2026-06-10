@@ -25,14 +25,24 @@ Sampling
   Vertical/perspective handling is already baked into :func:`encode`, so only a
   horizontal flip is a valid symmetry here.
 
-``sample(batch)`` returns torch tensors ``(planes, pi, z, mask)`` where ``mask``
-is derived from ``pi`` (legal = any move with positive target prob) so the
-training loss can mask illegal logits without needing the original Position.
+``sample(batch)`` returns torch tensors ``(planes, pi, z, mask)``.
+
+.. warning::
+    ``mask`` is derived as ``pi > 0`` and therefore only covers the moves the
+    MCTS actually **visited** -- it is NOT a true legal-move mask (legal but
+    unvisited moves are excluded). It must **not** be used to mask the training
+    policy loss: a subset-softmax leaves out-of-mask logits unconstrained, they
+    drift, and the model degrades (a confirmed root-cause class of bug). The
+    training loss (:func:`xqai.network.az_loss`) deliberately ignores this mask
+    and uses a full 8100-way cross-entropy instead. The field is returned only
+    for API/backward compatibility and for diagnostics; do not reintroduce it
+    into any loss or treat it as legality.
 """
 
 from __future__ import annotations
 
-import threading
+import fcntl
+import os
 from multiprocessing import shared_memory
 
 import numpy as np
@@ -73,6 +83,49 @@ _HFLIP_MOVE_PERM = _build_hflip_move_perm()
 
 
 # --------------------------------------------------------------------------- #
+# Cross-process lock                                                          #
+# --------------------------------------------------------------------------- #
+class _ShmLock:
+    """``flock``-based mutex shared by every process attached to the buffer.
+
+    A ``threading.Lock`` only synchronizes threads *within* one process; the
+    self-play workers are separate **processes**, so the write cursor needs a
+    kernel-level lock. ``flock`` on a file under ``/dev/shm`` is crash-safe
+    (released automatically when a holder dies) and needs no handle plumbing
+    through ``multiprocessing`` spawn.
+
+    Known limit: ``flock`` re-acquisition on the SAME fd is a no-op, so two
+    *threads* sharing one ReplayBuffer object are NOT mutually excluded (no
+    caller does this today; use one buffer object per thread if ever needed).
+    """
+
+    def __init__(self, name: str):
+        self.path = f"/dev/shm/{name}.lock"
+        self._fd = os.open(self.path, os.O_CREAT | os.O_RDWR, 0o666)
+
+    def __enter__(self):
+        fcntl.flock(self._fd, fcntl.LOCK_EX)
+        return self
+
+    def __exit__(self, *exc):
+        fcntl.flock(self._fd, fcntl.LOCK_UN)
+        return False
+
+    def close(self) -> None:
+        try:
+            os.close(self._fd)
+        except OSError:
+            pass
+
+    def unlink(self) -> None:
+        self.close()
+        try:
+            os.unlink(self.path)
+        except FileNotFoundError:
+            pass
+
+
+# --------------------------------------------------------------------------- #
 # ReplayBuffer                                                                #
 # --------------------------------------------------------------------------- #
 class ReplayBuffer:
@@ -110,7 +163,7 @@ class ReplayBuffer:
         self.recent_weight = recent_weight
         self.mirror_augment = mirror_augment
         self._rng = np.random.default_rng(seed)
-        self._lock = threading.Lock()
+        self._lock = _ShmLock(name)
 
         planes_bytes = self.capacity * _PLANES_SIZE * np.dtype(np.float16).itemsize
         pi_bytes = self.capacity * ACTION_DIM * np.dtype(np.float16).itemsize
@@ -155,7 +208,21 @@ class ReplayBuffer:
             except FileNotFoundError:
                 pass
             return shared_memory.SharedMemory(name=seg_name, create=True, size=max(size, 1))
-        return shared_memory.SharedMemory(name=seg_name, create=False)
+        # Attach WITHOUT resource_tracker registration. CPython <=3.12 also
+        # registers attach-only handles (bpo-38119); the tracker then unlinks
+        # the segment from /dev/shm when ANY attaching worker exits, so every
+        # later worker (re)start fails to attach. Suppress registration for
+        # this call: only the creator's tracker owns cleanup.
+        from multiprocessing import resource_tracker
+
+        orig_register = resource_tracker.register
+        try:
+            resource_tracker.register = lambda name, rtype: (
+                None if rtype == "shared_memory" else orig_register(name, rtype)
+            )
+            return shared_memory.SharedMemory(name=seg_name, create=False)
+        finally:
+            resource_tracker.register = orig_register
 
     # -- properties --------------------------------------------------------- #
     @property
@@ -184,12 +251,32 @@ class ReplayBuffer:
                 self.meta[1] += 1
 
     def add_batch(self, planes: np.ndarray, pi: np.ndarray, z: np.ndarray) -> None:
-        """Add many samples. ``planes`` [N,15,10,9], ``pi`` [N,8100], ``z`` [N]."""
-        planes = np.asarray(planes, dtype=np.float16)
-        pi = np.asarray(pi, dtype=np.float16)
-        z = np.asarray(z, dtype=np.int8)
-        for i in range(planes.shape[0]):
-            self.add(planes[i], pi[i], int(z[i]))
+        """Add many samples atomically. ``planes`` [N,15,10,9], ``pi`` [N,8100], ``z`` [N].
+
+        One lock acquisition + vectorized writes for the whole batch (the old
+        per-sample Python loop took the lock N times and was the throughput
+        bottleneck for big self-play flushes).
+        """
+        planes = np.asarray(planes, dtype=np.float16).reshape(-1, *_PLANES_SHAPE)
+        pi = np.asarray(pi, dtype=np.float16).reshape(-1, ACTION_DIM)
+        z = np.asarray(z, dtype=np.int8).reshape(-1)
+        n = planes.shape[0]
+        if n == 0:
+            return
+        if n > self.capacity:  # only the newest ``capacity`` samples survive anyway
+            planes, pi, z = planes[-self.capacity:], pi[-self.capacity:], z[-self.capacity:]
+            n = self.capacity
+        with self._lock:
+            cursor = int(self.meta[0])
+            idx = (cursor + np.arange(n)) % self.capacity
+            self.planes[idx] = planes
+            self.pi[idx] = pi
+            self.z[idx] = z
+            base = int(self.meta[2])
+            self.write_order[idx] = base + 1 + np.arange(n)
+            self.meta[2] = base + n
+            self.meta[0] = (cursor + n) % self.capacity
+            self.meta[1] = min(self.capacity, int(self.meta[1]) + n)
 
     # -- sampling ----------------------------------------------------------- #
     def _sample_indices(self, batch: int) -> np.ndarray:
@@ -213,12 +300,19 @@ class ReplayBuffer:
         - ``planes`` : float32 ``[B, 15, 10, 9]``
         - ``pi``     : float32 ``[B, 8100]`` (rows sum to 1)
         - ``z``      : float32 ``[B]``
-        - ``mask``   : float32 ``[B, 8100]`` legal mask derived from ``pi``
+        - ``mask``   : float32 ``[B, 8100]`` = ``(pi > 0)``. NOTE: this is the
+          MCTS-*visited* set, NOT a legal-move mask, and is ignored by the
+          training loss (see module docstring warning). Provided for API
+          compatibility / diagnostics only.
         """
-        idx = self._sample_indices(batch)
-        planes = self.planes[idx].astype(np.float32)        # [B,15,10,9]
-        pi = self.pi[idx].astype(np.float32)                # [B,8100]
-        z = self.z[idx].astype(np.float32)                  # [B]
+        # Index selection AND the gather both run under the cross-process lock:
+        # without it a worker can overwrite the very slots being gathered
+        # (ring-wrap), yielding torn samples (new planes with old pi/z).
+        with self._lock:
+            idx = self._sample_indices(batch)
+            planes = self.planes[idx].astype(np.float32)        # [B,15,10,9]
+            pi = self.pi[idx].astype(np.float32)                # [B,8100]
+            z = self.z[idx].astype(np.float32)                  # [B]
 
         if self.mirror_augment:
             flip = self._rng.random(batch) < 0.5
@@ -245,6 +339,7 @@ class ReplayBuffer:
                 shm.close()
             except Exception:
                 pass
+        self._lock.close()
 
     def unlink(self) -> None:
         """Destroy the shared-memory segments (creator only)."""
@@ -257,6 +352,7 @@ class ReplayBuffer:
                 shm.unlink()
             except FileNotFoundError:
                 pass
+        self._lock.unlink()
 
 
 __all__ = ["ReplayBuffer"]

@@ -42,4 +42,10 @@
 ## 代码现状（持续更新）
 - `cpp/`：规则内核（perft 1–5 命中标准值）+ Alpha-Beta + pybind，已审查修复（FEN 往返 bug 已修）。
 - `xqai/`：encoding/network/mcts(PUCT+Gumbel)/selfplay/replay(/dev/shm)/train/arena/dummynet，已审查修复（Gumbel 价值符号 bug 已修）。
-- 待办：torch cu124 装好 → 编译 _xqcore → GPU 端到端冒烟 → 多卡自对弈 + 监督预训练。
+- **2026-06-10 管线级 bug 修复（修复前的 RL 结论全部存疑，相关臂须重跑）**：
+  1. selfplay.py：`run(num_games=k)` 提前退出时把 ~98% 未完对局强制判和（z=0 污染 + 无残局样本）→ 改为持久化对局池，完局才 flush。**v2"warm-start 退化"与 frzV/safe 消融结论很可能由此 bug 制造**。
+  2. replay.py：跨进程写指针原用 threading.Lock（对多进程无效）→ 改 /dev/shm flock；add_batch 向量化；attach 不注册 resource_tracker（防 bpo-38119 worker 重启 attach 失败）。
+  3. train_value_safe.py / train_sup_continue.py：--freeze-value 原先 value_loss 仍反传进 trunk、BN running stats 仍漂移 → 冻结时 loss 排除 vloss + value 头 .eval()。
+  - 已验证：8 进程并发 6 万写零丢失零撕裂；冻结后 value 头 10 张量逐位不变；--smoke ALL PASS。
+- 已知未修（按优先级）：AB 引擎搜索内重复检测死代码(search.cpp do_move 不维护 seen_)、被将军仍 stand-pat、TT mate 分数未 ply 调整；eval 固定 10 开局统计功效不足；Gumbel 逐局串行非向量化；锚点评测不发 moves 历史（引擎对重复失明）。
+- 待办：等 suponly/verify 出结果 → 用修复版代码重跑 frzV/safe/rehNoFrz 三臂（旧进程跑的是修复前代码）。

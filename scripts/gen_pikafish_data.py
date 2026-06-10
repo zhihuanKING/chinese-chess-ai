@@ -47,6 +47,7 @@ from __future__ import annotations
 import argparse
 import os
 import random
+import re
 import subprocess
 import sys
 import time
@@ -209,6 +210,56 @@ class PikafishEngine:
                     raise EngineError(f"no legal bestmove returned: {line!r}")
                 return parts[1]
 
+    _INFO_RE = re.compile(
+        r"depth (\d+).*?multipv (\d+).*?score (cp|mate) (-?\d+).*? pv (\S+)")
+
+    def analyse(self, moves: List[str], depth: Optional[int] = None,
+                movetime: Optional[int] = None, timeout: float = 30.0):
+        """MultiPV analysis of the position after ``moves``.
+
+        Returns ``(ordered, root_cp)`` where ``ordered`` is
+        ``[(move_uci, cp), ...]`` for multipv 1..k (deepest completed line per
+        index), cp from the **side-to-move's** perspective; ``root_cp`` is the
+        best line's score. Mate scores are mapped to large signed cp so they
+        squash to ~±1 value and dominate the policy softmax. Requires the engine
+        to have been started with ``multipv > 1``.
+        """
+        if moves:
+            self._send("position startpos moves " + " ".join(moves))
+        else:
+            self._send("position startpos")
+        if depth is not None:
+            self._send(f"go depth {depth}")
+            wall = max(timeout, 5.0)
+        else:
+            mt = movetime if movetime is not None else 100
+            self._send(f"go movetime {mt}")
+            wall = max(timeout, mt / 1000.0 + 5.0)
+
+        deadline = time.monotonic() + wall
+        best = {}  # multipv idx -> (depth, cp, move_uci)
+        while True:
+            line = self._readline(deadline)
+            if line.startswith("info") and "multipv" in line and " pv " in line:
+                m = self._INFO_RE.search(line)
+                if m:
+                    d = int(m.group(1)); idx = int(m.group(2))
+                    typ = m.group(3); val = int(m.group(4)); mv = m.group(5)
+                    cp = val if typ == "cp" else \
+                        (30000 - min(abs(val), 1000)) * (1 if val >= 0 else -1)
+                    prev = best.get(idx)
+                    if prev is None or d >= prev[0]:
+                        best[idx] = (d, cp, mv)
+            elif line.startswith("bestmove"):
+                parts = line.split()
+                if len(parts) < 2 or parts[1] in ("(none)", "0000"):
+                    raise EngineError(f"no legal bestmove returned: {line!r}")
+                break
+        if not best:
+            raise EngineError("analyse: no multipv info parsed")
+        ordered = [(mv, cp) for _, (d, cp, mv) in sorted(best.items())]
+        return ordered, ordered[0][1]
+
 
 # ==========================================================================
 # self-play game loop
@@ -220,6 +271,11 @@ class GameRecord:
     random_opening: int = 0                           # number of random opening plies
     plies: int = 0
     error: Optional[str] = None
+    # Soft-label annotations (only filled in MultiPV mode): one tuple per
+    # *non-opening* Pikafish ply = (fen_before_move, side_is_black,
+    # [(move_uci, cp), ...], root_cp). Random opening plies are NOT annotated,
+    # so they never become policy targets (fixes the old random-move leak).
+    samples_raw: List = field(default_factory=list)
 
 
 def _position_result_to_z(result_code, c) -> int:
@@ -258,11 +314,18 @@ def play_one_game(engine: PikafishEngine, rng: random.Random, *,
         pos.push(mv)
         rec.random_opening += 1
 
+    soft = getattr(engine, "multipv", 1) > 1
     # --- Pikafish plays both sides ---------------------------------------
     while pos.result() == c.ONGOING and len(rec.moves) < max_moves:
         try:
-            uci_mv = engine.bestmove(rec.moves, depth=depth, movetime=movetime,
-                                     timeout=move_timeout)
+            if soft:
+                ordered, root_cp = engine.analyse(
+                    rec.moves, depth=depth, movetime=movetime,
+                    timeout=move_timeout)
+                uci_mv = ordered[0][0]
+            else:
+                uci_mv = engine.bestmove(rec.moves, depth=depth,
+                                         movetime=movetime, timeout=move_timeout)
         except EngineError as exc:
             rec.error = f"engine error at ply {len(rec.moves)}: {exc}"
             break
@@ -274,6 +337,11 @@ def play_one_game(engine: PikafishEngine, rng: random.Random, *,
         if mv_int not in set(pos.legal_moves()):
             rec.error = f"illegal engine move {uci_mv!r} at ply {len(rec.moves)}"
             break
+        if soft:
+            # Annotate this (non-opening) position with the MultiPV analysis
+            # *before* pushing the move: fen + side + top-k (move, cp) + root cp.
+            fen = pos.fen()
+            rec.samples_raw.append((fen, fen.split()[1] == "b", ordered, root_cp))
         rec.moves.append(uci_mv)
         pos.push(mv_int)
 
@@ -295,6 +363,7 @@ class WorkerConfig:
     threads: int
     hash_mb: int
     seed: int
+    multipv: int = 1                                  # >1 enables soft labels
 
 
 def _worker_run(cfg: WorkerConfig, n_games: int):
@@ -302,7 +371,7 @@ def _worker_run(cfg: WorkerConfig, n_games: int):
     rng = random.Random(cfg.seed)
     records: List[GameRecord] = []
     engine = PikafishEngine(cfg.engine_path, threads=cfg.threads,
-                            hash_mb=cfg.hash_mb)
+                            hash_mb=cfg.hash_mb, multipv=cfg.multipv)
     try:
         engine.start()
     except EngineError as exc:
@@ -323,7 +392,7 @@ def _worker_run(cfg: WorkerConfig, n_games: int):
             engine.close()
             try:
                 engine = PikafishEngine(cfg.engine_path, threads=cfg.threads,
-                                        hash_mb=cfg.hash_mb)
+                                        hash_mb=cfg.hash_mb, multipv=cfg.multipv)
                 engine.start()
             except EngineError as exc2:
                 records.append(rec)
@@ -377,8 +446,20 @@ def _write_raw_logs(records: List[GameRecord], raw_dir: str, run_tag: str) -> st
 
 
 def _encode_and_write(records: List[GameRecord], out_dir: str,
-                      shard_size: int, stats: GenStats) -> None:
-    """Replay each game through prepare_data and write shards (same format)."""
+                      shard_size: int, stats: GenStats, *,
+                      soft: bool = False, policy_temp: float = 100.0,
+                      value_scale: float = 500.0) -> None:
+    """Encode games to shards.
+
+    Hard mode (``soft=False``, legacy): one-hot ``pi_index`` (int32) + final
+    -result ``z`` (int8), built by replaying the move log through
+    :func:`prepare_data.game_to_samples`.
+
+    Soft mode (``soft=True``): dense ``pi`` (fp16, MultiPV ``softmax(cp/temp)``)
+    + continuous engine-eval ``z`` (fp16, ``tanh(cp/scale)``) from each game's
+    ``samples_raw`` — random-opening plies are already excluded there. The
+    ``"pi"`` key triggers the soft-label path in ``pretrain.ShardDataset``.
+    """
     import numpy as np
 
     os.makedirs(out_dir, exist_ok=True)
@@ -388,43 +469,70 @@ def _encode_and_write(records: List[GameRecord], out_dir: str,
     shard_idx = len(existing)
 
     buf_planes: List = []
-    buf_pi: List[int] = []
-    buf_z: List[int] = []
+    buf_pi: List = []
+    buf_z: List = []
 
     def flush():
         nonlocal shard_idx
         if not buf_planes:
             return
         path = os.path.join(out_dir, f"shard_{shard_idx:05d}.npz")
-        np.savez_compressed(
-            path,
-            planes=np.stack(buf_planes).astype(np.float16),
-            pi_index=np.asarray(buf_pi, dtype=np.int32),
-            z=np.asarray(buf_z, dtype=np.int8),
-        )
+        if soft:
+            np.savez_compressed(
+                path,
+                planes=np.stack(buf_planes).astype(np.float16),
+                pi=np.stack(buf_pi).astype(np.float16),
+                z=np.asarray(buf_z, dtype=np.float16),
+            )
+        else:
+            np.savez_compressed(
+                path,
+                planes=np.stack(buf_planes).astype(np.float16),
+                pi_index=np.asarray(buf_pi, dtype=np.int32),
+                z=np.asarray(buf_z, dtype=np.int8),
+            )
         shard_idx += 1
         buf_planes.clear()
         buf_pi.clear()
         buf_z.clear()
 
     for rec in records:
-        if rec.error or not rec.moves:
+        if rec.error:
             stats.games_errored += 1
             continue
-        moves_int = [pd.parse_iccs_move(m) for m in rec.moves]
-        samples, ok, _reason = pd.game_to_samples(moves_int, rec.result)
-        if not ok:
-            stats.skipped_games += 1
-            continue
-        stats.valid_games += 1
-        for s in samples:
-            planes, pi_index, z = pd.encode_sample(s)
-            buf_planes.append(planes)
-            buf_pi.append(pi_index)
-            buf_z.append(int(z))
-            stats.samples += 1
-            if len(buf_planes) >= shard_size:
-                flush()
+        if soft:
+            if not rec.samples_raw:
+                stats.skipped_games += 1
+                continue
+            stats.valid_games += 1
+            for fen, side_is_black, ordered, root_cp in rec.samples_raw:
+                planes, pi, z = pd.encode_soft_sample(
+                    fen, side_is_black, ordered, root_cp,
+                    policy_temp=policy_temp, value_scale=value_scale)
+                buf_planes.append(planes)
+                buf_pi.append(pi)
+                buf_z.append(z)
+                stats.samples += 1
+                if len(buf_planes) >= shard_size:
+                    flush()
+        else:
+            if not rec.moves:
+                stats.games_errored += 1
+                continue
+            moves_int = [pd.parse_iccs_move(m) for m in rec.moves]
+            samples, ok, _reason = pd.game_to_samples(moves_int, rec.result)
+            if not ok:
+                stats.skipped_games += 1
+                continue
+            stats.valid_games += 1
+            for s in samples:
+                planes, pi_index, z = pd.encode_sample(s)
+                buf_planes.append(planes)
+                buf_pi.append(pi_index)
+                buf_z.append(int(z))
+                stats.samples += 1
+                if len(buf_planes) >= shard_size:
+                    flush()
     flush()
 
 
@@ -432,7 +540,8 @@ def generate(*, games: int, workers: int, depth: Optional[int],
              movetime: Optional[int], out_dir: str, raw_dir: str,
              engine_path: str, max_moves: int, move_timeout: float,
              shard_size: int, threads: int, hash_mb: int,
-             seed: int) -> Tuple[GenStats, str]:
+             seed: int, multipv: int = 1, policy_temp: float = 100.0,
+             value_scale: float = 500.0) -> Tuple[GenStats, str]:
     """Run the full parallel generation + encoding pipeline. Returns (stats, raw_path)."""
     import multiprocessing as mp
 
@@ -445,6 +554,7 @@ def generate(*, games: int, workers: int, depth: Optional[int],
             engine_path=engine_path, depth=depth, movetime=movetime,
             max_moves=max_moves, move_timeout=move_timeout,
             threads=threads, hash_mb=hash_mb, seed=seed + 1000 * i,
+            multipv=multipv,
         )
         for i in range(workers)
     ]
@@ -476,7 +586,9 @@ def generate(*, games: int, workers: int, depth: Optional[int],
 
     run_tag = f"{int(time.time())}_{os.getpid()}_g{games}"
     raw_path = _write_raw_logs(records, raw_dir, run_tag)
-    _encode_and_write(records, out_dir, shard_size, stats)
+    _encode_and_write(records, out_dir, shard_size, stats,
+                      soft=multipv > 1, policy_temp=policy_temp,
+                      value_scale=value_scale)
     return stats, raw_path
 
 
@@ -538,6 +650,13 @@ def main(argv: Optional[List[str]] = None) -> int:
     parser.add_argument("--hash", type=int, default=16, dest="hash_mb",
                         help="engine hash MB per process (default 16)")
     parser.add_argument("--seed", type=int, default=0, help="RNG seed base")
+    parser.add_argument("--multipv", type=int, default=1,
+                        help="MultiPV k; >1 enables soft labels (engine softmax "
+                             "policy + cp-eval value, random openings excluded)")
+    parser.add_argument("--policy-temp", type=float, default=100.0,
+                        help="softmax temperature (cp) for soft policy (default 100)")
+    parser.add_argument("--value-scale", type=float, default=500.0,
+                        help="cp scale for value tanh(cp/scale) (default 500)")
     parser.add_argument("--smoke", action="store_true",
                         help="smoke mode: 4 games, depth 6, 2 workers, verify chain")
     args = parser.parse_args(argv)
@@ -560,7 +679,8 @@ def main(argv: Optional[List[str]] = None) -> int:
         out_dir=args.out, raw_dir=args.raw_out, engine_path=args.engine,
         max_moves=args.max_moves, move_timeout=args.move_timeout,
         shard_size=args.shard_size, threads=args.threads, hash_mb=args.hash_mb,
-        seed=args.seed,
+        seed=args.seed, multipv=args.multipv, policy_temp=args.policy_temp,
+        value_scale=args.value_scale,
     )
     _print_stats(stats, raw_path, args.out)
 
@@ -575,11 +695,20 @@ def main(argv: Optional[List[str]] = None) -> int:
                             if n.startswith("shard_") and n.endswith(".npz"))
             if shards:
                 d = np.load(os.path.join(args.out, shards[-1]))
-                p, pi, z = d["planes"], d["pi_index"], d["z"]
-                shape_ok = (p.ndim == 4 and p.shape[1:] == (15, 10, 9)
-                            and p.dtype == np.float16
-                            and pi.dtype == np.int32 and z.dtype == np.int8
-                            and p.shape[0] == pi.shape[0] == z.shape[0])
+                p, z = d["planes"], d["z"]
+                if "pi" in d.files:  # soft-label schema
+                    pi = d["pi"]
+                    shape_ok = (p.ndim == 4 and p.shape[1:] == (15, 10, 9)
+                                and p.dtype == np.float16
+                                and pi.ndim == 2 and pi.shape[1] == 8100
+                                and pi.dtype == np.float16 and z.dtype == np.float16
+                                and p.shape[0] == pi.shape[0] == z.shape[0])
+                else:                # legacy one-hot schema
+                    pi = d["pi_index"]
+                    shape_ok = (p.ndim == 4 and p.shape[1:] == (15, 10, 9)
+                                and p.dtype == np.float16
+                                and pi.dtype == np.int32 and z.dtype == np.int8
+                                and p.shape[0] == pi.shape[0] == z.shape[0])
                 print(f"[smoke] last shard {shards[-1]}: planes {p.shape} "
                       f"{p.dtype}, pi {pi.shape} {pi.dtype}, z {z.shape} {z.dtype} "
                       f"-> shape_ok={shape_ok}")

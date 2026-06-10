@@ -47,7 +47,7 @@ def _new_position():
 class _GameRecord:
     """Accumulates per-ply samples for one game until it terminates."""
 
-    __slots__ = ("pos", "planes", "pis", "movers", "done", "result")
+    __slots__ = ("pos", "planes", "pis", "movers", "done", "result", "ply")
 
     def __init__(self, pos):
         self.pos = pos
@@ -56,6 +56,7 @@ class _GameRecord:
         self.movers: list[int] = []  # side to move at each recorded ply
         self.done = False
         self.result = _ONGOING
+        self.ply = 0  # plies played in THIS game (games restart independently)
 
 
 def _outcome_z(result: int, mover: int) -> int:
@@ -120,7 +121,7 @@ class SelfPlayWorker:
         parallel_games: int = 8,
         n_sim: int = 64,
         temp_moves: int = 30,
-        resign_threshold: float | None = -0.95,
+        resign_threshold: float | None = None,
         max_plies: int = 400,
         seed: int | None = None,
     ):
@@ -133,45 +134,63 @@ class SelfPlayWorker:
         self.resign_threshold = resign_threshold
         self.max_plies = int(max_plies)
         self._rng = np.random.default_rng(seed)
+        # In-flight games persist ACROSS run() calls: a finished game's slot is
+        # refilled with a fresh game, never truncated. (A previous version
+        # rebuilt all games per call and force-scored the unfinished ones as
+        # draws -- with run(num_games=4) over 256 parallel games that mislabeled
+        # ~98% of samples z=0 and starved the buffer of endgames.)
+        self._games: list[_GameRecord] | None = None
 
     def run(self, num_games: int | None = None) -> dict[str, Any]:
-        """Play games until ``num_games`` finish (default: one full batch).
+        """Advance the persistent game pool until ``num_games`` finish.
+
+        Default target: one full batch (``parallel_games``). Games that do not
+        finish during this call simply stay in flight and continue on the next
+        call -- they are NEVER force-scored. Only samples from games that
+        actually terminated are flushed/returned, so every ``z`` is a real
+        outcome (the sole synthetic draw is the per-game ``max_plies`` safety
+        cap, which mirrors the rules' own draw caps).
 
         Returns a stats dict; samples are written to ``self.replay`` if set,
         otherwise collected and returned under ``"samples"``.
         """
         target = self.parallel_games if num_games is None else int(num_games)
 
-        games = [_GameRecord(_new_position()) for _ in range(self.parallel_games)]
+        if self._games is None:
+            self._games = [_GameRecord(_new_position()) for _ in range(self.parallel_games)]
+        games = self._games
         finished = 0
-        ply = 0
+        rounds = 0
         collected: list[tuple[np.ndarray, np.ndarray, int]] = []
         total_samples = 0
 
-        while finished < target and ply < self.max_plies:
-            live = [g for g in games if not g.done]
-            if not live:
-                break
+        while finished < target:
+            positions = [g.pos for g in games]
+            # === BATCHED MCTS over all games (single net forward inside). ===
+            pis = self.planner.search(positions, self.net, self.n_sim)
 
-            live_positions = [g.pos for g in live]
-            # === BATCHED MCTS over all live games (single net forward inside). ===
-            pis = self.planner.search(live_positions, self.net, self.n_sim)
-
-            temperature = 1.0 if ply < self.temp_moves else 0.0
-            for g, pi in zip(live, pis):
+            for gi, (g, pi) in enumerate(zip(games, pis)):
                 pos = g.pos
-                # Record the training sample for this ply (normalized frame).
-                g.planes.append(encode(pos).astype(np.float16))
-                g.pis.append(pi.astype(np.float16))
-                g.movers.append(pos.side_to_move())
+                temperature = 1.0 if g.ply < self.temp_moves else 0.0
 
                 move_norm = _sample_move(pi, temperature, self._rng)
                 if move_norm < 0:
                     # No legal move available -> mover loses (mate/stalemate).
+                    # This is a *terminal* node with no improved policy to learn
+                    # from, so we do NOT record a training sample for it (an
+                    # all-zero ``pi`` would otherwise poison the buffer / mask).
                     g.result = _BLACK_WIN if pos.side_to_move() == 0 else _RED_WIN
                     self._finish_game(g, collected)
                     finished += 1
+                    games[gi] = _GameRecord(_new_position())
                     continue
+
+                # Record the training sample for this ply (normalized frame).
+                # Done only once we know there is a valid (non-empty) policy at
+                # this position so ``pi`` and the derived legal mask are real.
+                g.planes.append(encode(pos).astype(np.float16))
+                g.pis.append(pi.astype(np.float16))
+                g.movers.append(pos.side_to_move())
 
                 # Optional resignation based on the root value estimate.
                 if self.resign_threshold is not None:
@@ -181,26 +200,31 @@ class SelfPlayWorker:
                         g.result = _BLACK_WIN if pos.side_to_move() == 0 else _RED_WIN
                         self._finish_game(g, collected)
                         finished += 1
+                        games[gi] = _GameRecord(_new_position())
                         continue
 
                 real_move = (
                     flip_move(move_norm) if pos.side_to_move() == BLACK else move_norm
                 )
                 pos.push(real_move)
+                g.ply += 1
 
                 res = pos.result()
                 if res != _ONGOING:
                     g.result = res
                     self._finish_game(g, collected)
                     finished += 1
+                    games[gi] = _GameRecord(_new_position())
+                elif g.ply >= self.max_plies:
+                    # Per-game safety cap (not a call-boundary truncation).
+                    g.result = _DRAW
+                    self._finish_game(g, collected)
+                    finished += 1
+                    games[gi] = _GameRecord(_new_position())
 
-            ply += 1
+            rounds += 1
 
-        # Any games still ongoing at max_plies are scored as draws.
-        for g in games:
-            if not g.done and g.planes:
-                g.result = _DRAW
-                self._finish_game(g, collected)
+        ply = rounds  # backward-compatible stats key: planner rounds this call
 
         # Flush collected samples to the replay buffer if present.
         if self.replay is not None and collected:

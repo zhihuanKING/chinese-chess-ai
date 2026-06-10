@@ -724,6 +724,55 @@ def encode_sample(sample: Sample):
     return planes, int(pi_index), np.int8(z)
 
 
+# Policy action space (move = from*90 + to), kept in sync with xqai.encoding.
+POLICY_SIZE = 8100
+
+
+def encode_soft_sample(fen: str, side_is_black: bool,
+                       move_cp_list, root_cp: float, *,
+                       policy_temp: float = 100.0, value_scale: float = 500.0):
+    """High-quality label encoder for engine-annotated positions (§ data v2).
+
+    Unlike :func:`encode_sample` (one-hot move + final game result), this turns
+    a Pikafish **MultiPV** analysis into a *soft* policy target and an engine-eval
+    value target:
+
+    - ``move_cp_list``: ``[(move_uci, cp), ...]`` for the top-k moves, cp scores
+      from the **side-to-move's** perspective (UCI convention). The policy is
+      ``softmax(cp / policy_temp)`` over these moves, written into a dense
+      ``[8100]`` vector (zero elsewhere) in the normalized (current-side) frame
+      so it is consistent with ``encode`` / ``flip_move`` (§4).
+    - ``root_cp``: the position's engine score (best line), squashed to
+      ``v = tanh(root_cp / value_scale) in (-1, 1)`` — a dense value signal that
+      avoids the draw-dominated, sparse final-result label.
+
+    Returns ``(planes f16[15,10,9], pi f16[8100], z f16 scalar)``. The shard
+    ``"pi"`` key triggers :class:`pretrain.ShardDataset`'s soft-label path;
+    ``"z"`` is read as float, so a continuous value just works.
+    """
+    import numpy as np
+
+    xqcore = _try_import_xqcore()
+    encoding = _try_import_encoding()
+    if xqcore is None or encoding is None:
+        raise RuntimeError("xqai._xqcore / xqai.encoding unavailable")
+
+    pos = xqcore.Position.from_fen(fen)
+    planes = encoding.encode(pos).astype(np.float16)
+
+    pi = np.zeros(POLICY_SIZE, dtype=np.float32)
+    if move_cp_list:
+        cps = np.array([cp for _, cp in move_cp_list], dtype=np.float64)
+        w = np.exp((cps - cps.max()) / float(policy_temp))
+        w /= w.sum()
+        for (mv_uci, _), prob in zip(move_cp_list, w):
+            mv_int = parse_iccs_move(mv_uci)
+            idx = encoding.flip_move(mv_int) if side_is_black else mv_int
+            pi[int(idx)] += float(prob)
+    z = float(np.tanh(float(root_cp) / float(value_scale)))
+    return planes, pi.astype(np.float16), np.float16(z)
+
+
 # ==========================================================================
 # 3. round-trip verification
 # ==========================================================================

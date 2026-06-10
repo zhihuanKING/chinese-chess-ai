@@ -47,7 +47,7 @@ if _ROOT not in sys.path:
     sys.path.insert(0, _ROOT)
 
 from xqai.encoding import ACTION_DIM, NUM_COLS, NUM_PLANES, NUM_ROWS, encode, legal_mask
-from xqai.network import PVNet, az_loss
+from xqai.network import PVNet
 
 
 # --------------------------------------------------------------------------- #
@@ -97,9 +97,12 @@ class ShardDataset(Dataset):
         if d is None:
             npz = np.load(self.files[si], mmap_mode="r")
             d = {"planes": npz["planes"], "z": npz["z"]}
-            if "pi" in npz.files:
+            if "pi_idx" in npz.files:       # sparse soft labels (uncompressed -> real mmap)
+                d["pi_idx"] = npz["pi_idx"]
+                d["pi_val"] = npz["pi_val"]
+            elif "pi" in npz.files:         # dense soft labels (legacy; loads full -> heavy)
                 d["pi"] = npz["pi"]
-            else:
+            else:                           # one-hot
                 d["pi_index"] = npz["pi_index"]
             self._cache[si] = d
         return d
@@ -113,7 +116,15 @@ class ShardDataset(Dataset):
         z = np.float32(d["z"][off])
 
         pi = np.zeros(ACTION_DIM, dtype=np.float32)
-        if "pi" in d:
+        if "pi_idx" in d:
+            idx = np.asarray(d["pi_idx"][off], dtype=np.int64)
+            val = np.asarray(d["pi_val"][off], dtype=np.float32)
+            pi[idx] = val                       # scatter top-k probs into dense
+            s = pi.sum()
+            if s > 0:
+                pi /= s
+            mask = (pi > 0.0).astype(np.float32)
+        elif "pi" in d:
             pi[:] = np.asarray(d["pi"][off], dtype=np.float32)
             s = pi.sum()
             if s > 0:
@@ -133,6 +144,54 @@ class ShardDataset(Dataset):
             torch.tensor(z),
             torch.from_numpy(mask),
         )
+
+
+class FlatDataset(Dataset):
+    """Flat row-level memmap dataset (sparse soft labels) — OOM-proof.
+
+    Reads four big ``.npy`` files built by ``build_flat_memmap.py``:
+    ``planes[N,15,10,9]f16``, ``pi_idx[N,8]i16``, ``pi_val[N,8]f16``, ``z[N]f16``.
+    ``np.load(mmap_mode="r")`` on a ``.npy`` is a **true** memmap (unlike npz),
+    so ``__getitem__`` pages in only the requested row and all workers share one
+    OS page cache — random shuffle over 5M samples no longer balloons RAM.
+    """
+
+    def __init__(self, data_dir: str):
+        j = lambda n: os.path.join(data_dir, n)
+        self.planes = np.load(j("planes.npy"), mmap_mode="r")
+        self.pi_idx = np.load(j("pi_idx.npy"), mmap_mode="r")
+        self.pi_val = np.load(j("pi_val.npy"), mmap_mode="r")
+        self.z = np.load(j("z.npy"), mmap_mode="r")
+        self._n = int(self.planes.shape[0])
+        self.files = [j("planes.npy")]  # for logging parity with ShardDataset
+
+    def __len__(self) -> int:
+        return self._n
+
+    def __getitem__(self, i: int):
+        planes = np.asarray(self.planes[i], dtype=np.float32)
+        pi = np.zeros(ACTION_DIM, dtype=np.float32)
+        idx = np.asarray(self.pi_idx[i], dtype=np.int64)
+        val = np.asarray(self.pi_val[i], dtype=np.float32)
+        pi[idx] = val
+        s = pi.sum()
+        if s > 0:
+            pi /= s
+        mask = (pi > 0.0).astype(np.float32)
+        z = np.float32(self.z[i])
+        return (
+            torch.from_numpy(planes),
+            torch.from_numpy(pi),
+            torch.tensor(z),
+            torch.from_numpy(mask),
+        )
+
+
+def make_dataset(data_dir: str):
+    """Pick FlatDataset when a flat memmap store exists, else sharded npz."""
+    if os.path.exists(os.path.join(data_dir, "planes.npy")):
+        return FlatDataset(data_dir)
+    return ShardDataset(data_dir)
 
 
 # --------------------------------------------------------------------------- #
@@ -227,6 +286,8 @@ def main() -> int:
     ap.add_argument("--workers", type=int, default=4, help="DataLoader workers")
     ap.add_argument("--min-lr", type=float, default=1e-5)
     ap.add_argument("--log-every", type=int, default=50)
+    ap.add_argument("--save-every", type=int, default=0,
+                    help="每 N 步存一个带 step 标记的 checkpoint(0=关);用于细粒度监督学习曲线")
     args = ap.parse_args()
 
     # ---- DDP init (only when launched under torchrun) -------------------- #
@@ -250,7 +311,7 @@ def main() -> int:
     world = _world_size()
 
     # ---- data ------------------------------------------------------------ #
-    ds = ShardDataset(args.data)
+    ds = make_dataset(args.data)
     if use_ddp:
         sampler = DistributedSampler(ds, num_replicas=world, rank=rank, shuffle=True)
         loader = DataLoader(
@@ -333,6 +394,12 @@ def main() -> int:
             if rank == 0 and args.log_every and global_step % args.log_every == 0:
                 print(f"[pretrain] e{epoch} step{global_step}/{total_steps} "
                       f"loss={lv:.4f} lr={lr:.2e}", flush=True)
+            if rank == 0 and args.save_every and global_step % args.save_every == 0:
+                _sp = os.path.join(args.out, f"pstep_{global_step:07d}.pt")
+                _tmp = _sp + ".tmp"
+                torch.save({"model": raw_model.state_dict(), "channels": args.channels,
+                            "blocks": args.blocks, "step": global_step}, _tmp)
+                os.replace(_tmp, _sp)
 
         # ---- epoch end: checkpoint + diagnostics (rank 0 only) ----------- #
         if rank == 0:

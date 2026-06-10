@@ -40,6 +40,7 @@ Only adds this file; never modifies ``xqai/*.py``.
 from __future__ import annotations
 
 import argparse
+import glob
 import os
 import signal
 import sys
@@ -48,6 +49,48 @@ import time
 import numpy as np
 import torch
 import torch.multiprocessing as mp
+
+
+# --------------------------------------------------------------------------- #
+# Supervised rehearsal pool (value/policy anchor)                             #
+# --------------------------------------------------------------------------- #
+class SupervisedPool:
+    """In-RAM pool of Pikafish-labelled supervised samples for RL rehearsal.
+
+    Mixing a fraction of these into each learner batch pins the value head to
+    Pikafish's *stationary* evaluation (z = tanh(cp/scale)) and the policy head
+    to Pikafish's soft policy -- a direct antidote to warm-start value-head
+    drift / catastrophic forgetting during self-play RL.
+    """
+
+    def __init__(self, data_dir: str, n_shards: int, seed: int = 0):
+        files = sorted(glob.glob(os.path.join(data_dir, "shard_*.npz")))
+        if not files:
+            raise FileNotFoundError(f"no shard_*.npz under {data_dir!r}")
+        rng = np.random.default_rng(seed)
+        rng.shuffle(files)
+        files = files[: max(1, n_shards)]
+        pl, pis, zs = [], [], []
+        for f in files:
+            d = np.load(f)
+            if "pi" not in d.files:
+                continue  # require dense soft labels (v2 format)
+            pl.append(np.asarray(d["planes"], dtype=np.float16))
+            pi = np.asarray(d["pi"], dtype=np.float32)
+            s = pi.sum(1, keepdims=True); s[s == 0] = 1.0; pi /= s
+            pis.append(pi.astype(np.float16))
+            zs.append(np.asarray(d["z"], dtype=np.float16))
+        self.planes = torch.from_numpy(np.concatenate(pl))
+        self.pi = torch.from_numpy(np.concatenate(pis))
+        self.z = torch.from_numpy(np.concatenate(zs))
+        self.n = int(self.planes.shape[0])
+        self._rng = np.random.default_rng(seed + 1)
+        print(f"[sup-pool] loaded {self.n} supervised samples from {len(files)} "
+              f"shards of {data_dir}", flush=True)
+
+    def sample(self, k: int):
+        idx = torch.from_numpy(self._rng.integers(0, self.n, size=k))
+        return (self.planes[idx].float(), self.pi[idx].float(), self.z[idx].float())
 
 _ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _ROOT not in sys.path:
@@ -290,6 +333,21 @@ def main() -> int:
     ap.add_argument("--export-every", type=int, default=None)
     ap.add_argument("--capacity", type=int, default=None)
     ap.add_argument("--min-buffer", type=int, default=None)
+    # ---- value-safe RL ablation knobs ----------------------------------- #
+    ap.add_argument("--freeze-value", action="store_true",
+                    help="freeze value head (value_conv/value_fc1/value_fc2) so "
+                         "self-play z noise cannot corrupt the calibrated head")
+    ap.add_argument("--rehearse-dir", default=None,
+                    help="supervised shard dir to mix in (Pikafish soft labels = "
+                         "value+policy anchor), e.g. data/processed_v2")
+    ap.add_argument("--rehearse-frac", type=float, default=0.0,
+                    help="fraction of each learner batch drawn from rehearse-dir")
+    ap.add_argument("--rehearse-shards", type=int, default=60,
+                    help="number of supervised shards to load into RAM pool")
+    ap.add_argument("--ckpt-dir", default=None,
+                    help="override checkpoint dir (isolate parallel arms)")
+    ap.add_argument("--replay-suffix", default="",
+                    help="suffix for /dev/shm replay name (isolate parallel arms)")
     args = ap.parse_args()
 
     cfg = load_config(args.config)
@@ -348,7 +406,7 @@ def main() -> int:
         cfg_d["network"]["channels"] = ckpt_c
         cfg_d["network"]["blocks"] = ckpt_b
 
-    ckpt_dir = cfg_d["paths"]["checkpoints"]
+    ckpt_dir = args.ckpt_dir or cfg_d["paths"]["checkpoints"]
     os.makedirs(ckpt_dir, exist_ok=True)
     # latest.pt = learner's unconditional "candidate" export (polled by the gate).
     # best.pt   = the "champion" the gate promotes to; this is what self-play
@@ -359,6 +417,8 @@ def main() -> int:
     replay_name = "xqai_replay_smoke" if args.smoke else os.path.basename(
         cfg_d["replay"]["dir"]
     ).replace("/", "_") or "xqai_replay"
+    if args.replay_suffix:
+        replay_name = f"{replay_name}_{args.replay_suffix}"
 
     device = torch.device(f"cuda:{learner_gpu}" if torch.cuda.is_available() else "cpu")
 
@@ -399,9 +459,39 @@ def main() -> int:
               f"{cfg_d['network']['blocks']} from {args.init}", flush=True)
     model.train()
 
+    # ---- value-safe: freeze the value head ------------------------------ #
+    # The cold-start value head is calibrated on Pikafish outcomes; self-play z
+    # (weak-vs-weak games) is off-distribution and corrupts it, which then
+    # corrupts MCTS leaf evals -> policy targets -> downward feedback. Freezing
+    # pins the value head at its calibrated state and tests whether value drift
+    # is the mechanism behind warm-start RL degradation.
+    if args.freeze_value:
+        frozen = 0
+        for mod_name in ("value_conv", "value_fc1", "value_fc2"):
+            mod = getattr(model, mod_name, None)
+            if mod is not None:
+                for p in mod.parameters():
+                    p.requires_grad = False
+                    frozen += 1
+                # BatchNorm running stats are buffers, not parameters: in train
+                # mode they keep updating from every batch and get exported,
+                # silently un-freezing the head. Keep the head in eval mode.
+                mod.eval()
+        print(f"[learner] FROZEN value head ({frozen} param tensors + BN stats); "
+              f"value_loss EXCLUDED from total loss (would otherwise still "
+              f"backprop through the frozen head into the trunk); "
+              f"only trunk+policy train", flush=True)
+
+    # ---- supervised rehearsal pool (value/policy anchor) ---------------- #
+    sup_pool = None
+    if args.rehearse_dir and args.rehearse_frac > 0:
+        sup_pool = SupervisedPool(args.rehearse_dir, args.rehearse_shards, seed=11)
+        print(f"[learner] rehearsal ON: frac={args.rehearse_frac} "
+              f"dir={args.rehearse_dir}", flush=True)
+
     # AdamW：冷启动微调更稳、对 lr 宽容（原 SGD lr=0.02 会把预训练权重打崩=灾难性遗忘）。
     optimizer = torch.optim.AdamW(
-        model.parameters(), lr=cfg_d["train"]["lr_rl"],
+        [p for p in model.parameters() if p.requires_grad], lr=cfg_d["train"]["lr_rl"],
         weight_decay=cfg_d["train"]["weight_decay"],
     )
     amp_dtype = (torch.bfloat16 if str(cfg_d["train"]["precision"]).lower().startswith("bf")
@@ -500,8 +590,19 @@ def main() -> int:
                 print(f"[learner] buffer reached min_buffer ({buf_now} >= "
                       f"{min_buffer}) -> training", flush=True)
 
-            batch = replay.sample(cfg_d["train"]["batch_size"])
-            planes, pi, z, mask = (t.to(device, non_blocking=True) for t in batch)
+            B = cfg_d["train"]["batch_size"]
+            n_sup = int(B * args.rehearse_frac) if sup_pool is not None else 0
+            n_self = B - n_sup
+            sb = replay.sample(n_self)
+            sp, spi, sz = (sb[0].float(), sb[1].float(), sb[2].float())
+            if n_sup > 0:
+                gp, gpi, gz = sup_pool.sample(n_sup)
+                sp = torch.cat([sp, gp], 0)
+                spi = torch.cat([spi, gpi], 0)
+                sz = torch.cat([sz, gz], 0)
+            planes = sp.to(device, non_blocking=True)
+            pi = spi.to(device, non_blocking=True)
+            z = sz.to(device, non_blocking=True)
             optimizer.zero_grad(set_to_none=True)
             ctxm = (torch.autocast("cuda", dtype=amp_dtype)
                     if amp_dtype is not None else _Null())
@@ -512,16 +613,22 @@ def main() -> int:
                 logp = torch.log_softmax(logits.float(), dim=1)
                 policy_loss = -(pi.float() * logp).sum(dim=1).mean()
                 value_loss = torch.nn.functional.mse_loss(value.float().squeeze(1), z.float())
-                loss = value_loss + policy_loss
+                # freeze-value 的本意是隔离 value 机理:若 value_loss 仍计入总损失,
+                # 其梯度会穿过(参数不更新的)value 头流进共享 trunk,冻结失效。
+                # 冻结时 value_loss 仅作监控指标(反映 trunk 漂移对 value 输出的影响)。
+                loss = policy_loss if args.freeze_value else value_loss + policy_loss
             loss.backward()
             optimizer.step()
             last_loss = float(loss.detach())
+            last_vloss = float(value_loss.detach())
             step += 1
 
             # Heartbeat: print step/loss periodically so progress is observable
             # without waiting for an export multiple (export_every can be large).
+            # vloss is monitoring-only under --freeze-value (not in the loss).
             if (time.time() - t_last_step_log) >= 10.0:
-                print(f"[learner] step={step} loss={last_loss:.4f} buf={len(replay)} "
+                print(f"[learner] step={step} loss={last_loss:.4f} "
+                      f"vloss={last_vloss:.4f} buf={len(replay)} "
                       f"exports={exported}", flush=True)
                 t_last_step_log = time.time()
 
@@ -535,6 +642,14 @@ def main() -> int:
                     buf = len(replay)
                     print(f"[learner] step={step} loss={last_loss:.4f} buf={buf} "
                           f"exports={exported}", flush=True)
+        # Final export: when ``steps`` is not a multiple of ``export_every`` the
+        # tail window would otherwise never be evaluated (e.g. 10000 steps with
+        # export_every=800 used to stop exporting at 9600).
+        if step > 0 and export_every and step % export_every != 0:
+            _export_checkpoint(model, ckpt_path, channels=cfg_d["network"]["channels"],
+                               blocks=cfg_d["network"]["blocks"], step=step)
+            exported += 1
+            print(f"[learner] final export at step={step}", flush=True)
     except KeyboardInterrupt:
         print("\n[learner] KeyboardInterrupt -> graceful shutdown", flush=True)
         stop_evt.set()

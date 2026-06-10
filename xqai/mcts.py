@@ -399,7 +399,9 @@ class GumbelPlanner:
 
         roots = [_PUCTNode(p.side_to_move()) for p in positions]
         # Root expansion: one batched forward for all B roots.
-        root_logits = self._eval_batch(positions, roots, net, want_logits=True)
+        root_logits, root_values = self._eval_batch(
+            positions, roots, net, want_logits=True
+        )
 
         # Per-game Gumbel state.
         states: list[_GumbelState] = []
@@ -414,7 +416,12 @@ class GumbelPlanner:
             # Top-m candidates by g + logits.
             cand = np.argsort(-(g + logits))[:m]
             states.append(
-                _GumbelState(logits=logits.astype(np.float32), g=g, cand=cand)
+                _GumbelState(
+                    logits=logits.astype(np.float32),
+                    g=g,
+                    cand=cand,
+                    v_root=float(root_values[gi]),
+                )
             )
 
         # Sequential Halving schedule over the candidate set.
@@ -579,35 +586,60 @@ class GumbelPlanner:
             self._backup(path, v)
 
     # -- scoring / policy --------------------------------------------------- #
-    def _root_q(self, root: _PUCTNode) -> np.ndarray:
+    def _root_q(self, root: _PUCTNode, st: "_GumbelState | None" = None) -> np.ndarray:
         """Completed Q at the root for every legal move (root mover's view).
 
-        Visited children use ``W/N``; unvisited use the value estimate, which we
-        approximate by 0 (a 0-centered prior) — kept simple per the docstring.
+        Visited children use ``W/N``. Unvisited children are *completed* with the
+        Gumbel paper's ``v_mix`` estimate (Danihelka et al., 2022, App. B) rather
+        than a flat 0, so the improved-policy target is a genuine improvement and
+        not just the raw network policy. ``v_mix`` interpolates the root value
+        ``v_root`` with the prior-weighted mean of the visited children's Q::
 
-        ``W`` is accumulated by :meth:`_backup`, which flips the sign on the
-        first (leaf->edge) step, so ``W/N`` is **already** expressed from this
-        node's (the root's) mover perspective — same convention as
+            v_mix = (v_root + (ΣN / Σ_visited P) · Σ_visited P·q) / (1 + ΣN)
+
+        ``W`` is accumulated by :meth:`_backup`, which flips the sign on the first
+        (leaf->edge) step, so ``W/N`` is **already** expressed from this node's
+        (the root's) mover perspective — same convention as
         :meth:`_select_child`'s ``q``. No extra negation here (negating again was
         a bug that inverted the completed-Q sign and made Gumbel prefer losing
         moves).
         """
         n = root.N
-        return np.where(n > 0, root.W / np.maximum(n, 1.0), 0.0)
+        q_visited = np.where(n > 0, root.W / np.maximum(n, 1.0), 0.0)
+        if st is None or st.v_root is None:
+            # No root value available -> fall back to 0 for unvisited.
+            return np.where(n > 0, q_visited, 0.0)
+
+        visited = n > 0
+        sum_n = float(n.sum())
+        if sum_n <= 0:
+            # Nothing visited yet -> every move completes to the root value.
+            return np.full_like(q_visited, st.v_root)
+
+        p = st.logits  # priors are stored as logits; convert to a softmax prior.
+        prior = np.exp(p - p.max())
+        prior /= prior.sum()
+        sum_p_visited = float(prior[visited].sum())
+        if sum_p_visited > 0:
+            weighted_q = float((prior[visited] * q_visited[visited]).sum())
+            v_mix = (st.v_root + (sum_n / sum_p_visited) * weighted_q) / (1.0 + sum_n)
+        else:
+            v_mix = st.v_root
+        return np.where(visited, q_visited, v_mix)
 
     def _sigma(self, q: np.ndarray, root: _PUCTNode) -> np.ndarray:
         max_n = float(root.N.max()) if root.N.size else 0.0
         return (self.c_visit + max_n) * self.c_scale * q
 
     def _gumbel_scores(self, root, st, survivors) -> np.ndarray:
-        q = self._root_q(root)
+        q = self._root_q(root, st)
         sig = self._sigma(q, root)
         idx = np.array(survivors)
         return st.g[idx] + st.logits[idx] + sig[idx]
 
     def _improved_policy(self, root, st) -> np.ndarray:
         """Completed-value softmax over all legal root moves -> pi[ACTION_DIM]."""
-        q = self._root_q(root)
+        q = self._root_q(root, st)
         sig = self._sigma(q, root)
         scaled = st.logits + sig
         scaled = scaled - scaled.max()
@@ -620,7 +652,12 @@ class GumbelPlanner:
 
     # -- batched root/leaf eval (shared) ------------------------------------ #
     def _eval_batch(self, positions, nodes, net, want_logits: bool = False):
-        """# === BATCHED NN EVAL ===  expand a batch of roots in one forward."""
+        """# === BATCHED NN EVAL ===  expand a batch of roots in one forward.
+
+        Returns ``(logits, values)`` when ``want_logits`` (so the caller can keep
+        the root value for the Gumbel ``v_mix`` completion), otherwise
+        ``(probs, values)``.
+        """
         device = _net_device(net)
         planes = np.stack([encode(p) for p in positions])
         masks = np.stack([legal_mask(p) for p in positions])
@@ -665,7 +702,7 @@ class GumbelPlanner:
             node.vloss = np.zeros(len(moves), np.float32)
             node.children = [None] * len(moves)
             node.is_expanded = True
-        return logits_np if want_logits else (probs_np, values_np)
+        return (logits_np, values_np) if want_logits else (probs_np, values_np)
 
     # PUCT helpers reused for in-subtree descent.
     def _select_child(self, node: _PUCTNode) -> int:
@@ -685,14 +722,15 @@ class GumbelPlanner:
 
 
 class _GumbelState:
-    __slots__ = ("logits", "g", "cand", "survivors", "is_empty")
+    __slots__ = ("logits", "g", "cand", "survivors", "is_empty", "v_root")
 
-    def __init__(self, logits=None, g=None, cand=None):
+    def __init__(self, logits=None, g=None, cand=None, v_root=None):
         self.logits = logits
         self.g = g
         self.cand = cand
         self.survivors = list(cand) if cand is not None else []
         self.is_empty = logits is None
+        self.v_root = v_root  # network value at the root (root mover's view)
 
     @classmethod
     def empty(cls) -> "_GumbelState":

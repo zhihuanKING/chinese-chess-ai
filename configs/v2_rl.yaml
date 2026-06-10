@@ -50,5 +50,5 @@ distributed:
 
 paths:
   data: /mnt/nvme3n1/gameTheory/data
-  checkpoints: /mnt/nvme3n1/gameTheory/checkpoints
+  checkpoints: /mnt/nvme3n1/gameTheory/checkpoints_v2_rl
   logs: /mnt/nvme3n1/gameTheory/logs

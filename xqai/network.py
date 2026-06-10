@@ -126,6 +126,19 @@ def masked_log_softmax(logits: torch.Tensor, mask: torch.Tensor) -> torch.Tensor
     fall back to an unmasked log-softmax.
 
     Returns log-probabilities ``[B, action_dim]``; illegal entries are ``-inf``.
+
+    .. warning::
+        This is for **inference / move selection** (MCTS priors), where masking
+        to legal moves is correct. Do **NOT** use it inside the training policy
+        loss. A masked (subset) softmax leaves the logits of all out-of-mask
+        moves completely unconstrained by the gradient; those logits then drift
+        arbitrarily during training. If the mask is anything narrower than "all
+        legal moves" (e.g. an MCTS-visit-derived mask, or a single-move one-hot)
+        the unvisited/illegal logits can drift high and get picked at play time
+        -> the model degrades. The training loss must instead be a cross-entropy
+        over the **full** action space (see :func:`az_loss`), which actively
+        pushes every non-target logit down. This was the root cause of two
+        confirmed RL/pretrain degradation bugs.
     """
     mask = mask.to(dtype=logits.dtype)
     has_legal = mask.sum(dim=-1, keepdim=True) > 0
@@ -145,19 +158,36 @@ def az_loss(
     value: torch.Tensor,
     pi_target: torch.Tensor,
     z: torch.Tensor,
-    mask: torch.Tensor,
+    mask: torch.Tensor | None = None,
     c: float = 1e-4,
     model: nn.Module | None = None,
 ) -> torch.Tensor:
     """AlphaZero loss (§5): value MSE + policy cross-entropy + L2.
 
+    The policy term is a cross-entropy over the **full** action space
+    (``-sum_a pi_a * log_softmax(logits)_a``). It is deliberately **not** a
+    masked / subset softmax.
+
+    .. warning::
+        Do not reintroduce masking into the policy loss. Masking the softmax to
+        a subset of moves (legal-only, MCTS-visited-only, or a single-move
+        one-hot) leaves the out-of-mask logits unconstrained by the gradient;
+        they drift during training and can be selected at play time, causing the
+        model to degrade. The full-space cross-entropy used here actively pushes
+        every non-target logit down. ``pi_target`` is already zero on
+        illegal/unvisited moves, so the full-space CE never rewards them. The
+        ``mask`` argument is accepted only for call-site backward compatibility
+        and is **ignored** for the policy loss (masking belongs in MCTS / move
+        selection via :func:`masked_log_softmax`, not in training).
+
     Parameters
     ----------
     policy_logits : ``[B, action_dim]`` raw logits from :meth:`PVNet.forward`.
-    value         : ``[B, 1]`` predicted value in ``[-1, 1]``.
+    value         : ``[B, 1]`` predicted value in ``[-1, 1]`` (side-to-move view).
     pi_target     : ``[B, action_dim]`` MCTS target distribution (rows sum to 1).
-    z             : ``[B]`` or ``[B, 1]`` game outcome in ``[-1, 1]``.
-    mask          : ``[B, action_dim]`` legal-move mask (1 = legal).
+    z             : ``[B]`` or ``[B, 1]`` game outcome in ``[-1, 1]``
+                    (side-to-move view, matching :func:`xqai.encoding.encode`).
+    mask          : ignored; kept for backward compatibility (see warning).
     c             : L2 weight-decay coefficient (default 1e-4).
     model         : optional module whose weights contribute the ``c*||w||^2``
                     term. If ``None`` the L2 term is omitted (e.g. when weight
@@ -167,13 +197,16 @@ def az_loss(
     -------
     A scalar loss tensor (mean over the batch, plus the optional L2 term).
     """
+    del mask  # intentionally unused: see warning above.
     value = value.reshape(-1)
     z = z.reshape(-1).to(dtype=value.dtype)
     value_loss = F.mse_loss(value, z)
 
-    log_probs = masked_log_softmax(policy_logits, mask)
-    # Cross-entropy: -sum_a pi_a * log p_a, averaged over the batch.
-    policy_loss = -(pi_target * log_probs).sum(dim=-1).mean()
+    # Full action-space cross-entropy (NOT a masked/subset softmax). pi_target is
+    # zero on illegal/unvisited moves, so this never rewards them while actively
+    # suppressing every non-target logit.
+    log_probs = F.log_softmax(policy_logits.float(), dim=-1)
+    policy_loss = -(pi_target.float() * log_probs).sum(dim=-1).mean()
 
     loss = value_loss + policy_loss
 

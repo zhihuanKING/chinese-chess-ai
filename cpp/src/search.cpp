@@ -3,6 +3,8 @@
 #include <algorithm>
 #include <chrono>
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
 #include <vector>
 
 #include "xq/types.h"
@@ -33,6 +35,14 @@ struct SearchState {
     Clock::time_point deadline;
     bool stop = false;
     uint64_t nodes = 0;
+    // ---- optional diagnostics (no effect on search result) ----
+    uint64_t tt_probe = 0;      // negamax TT lookups
+    uint64_t tt_hit = 0;        // probes whose key matched
+    uint64_t tt_cut = 0;        // hits deep enough to return/narrow bound
+    uint64_t internal = 0;      // interior nodes that generated moves
+    uint64_t cutoffs = 0;       // interior nodes with a beta cutoff
+    uint64_t first_cut = 0;     // cutoffs on the 1st searched legal move
+    int depth_reached = 0;      // last fully completed iterative-deepening depth
 
     explicit SearchState(size_t mb = 64) {
         size_t entries = (mb * 1024 * 1024) / sizeof(TTEntry);
@@ -122,9 +132,12 @@ int negamax(Position& p, int depth, int alpha, int beta, int ply,
     int alpha_orig = alpha;
     uint64_t key = p.zobrist();
     Move tt_move = kNoMove;
+    ss.tt_probe++;
     if (TTEntry* e = ss.probe(key)) {
+        ss.tt_hit++;
         tt_move = e->best;
         if (e->depth >= depth) {
+            ss.tt_cut++;
             if (e->bound == BOUND_EXACT) return e->value;
             if (e->bound == BOUND_LOWER && e->value > alpha) alpha = e->value;
             else if (e->bound == BOUND_UPPER && e->value < beta) beta = e->value;
@@ -141,6 +154,7 @@ int negamax(Position& p, int depth, int alpha, int beta, int ply,
     int best = -kInf;
     Move best_move = kNoMove;
     int legal = 0;
+    ss.internal++;
 
     for (Move m : pseudo) {
         if (!p.do_move(m)) continue;
@@ -154,7 +168,11 @@ int negamax(Position& p, int depth, int alpha, int beta, int ply,
             best_move = m;
         }
         if (score > alpha) alpha = score;
-        if (alpha >= beta) break;  // cutoff
+        if (alpha >= beta) {  // cutoff
+            ss.cutoffs++;
+            if (legal == 1) ss.first_cut++;
+            break;
+        }
     }
 
     if (legal == 0) {
@@ -230,10 +248,32 @@ Move search(Position& p, int time_ms) {
         if (iter_best != kNoMove && (completed || best == kNoMove))
             best = iter_best;
 
+        if (completed) ss.depth_reached = depth;
         if (!completed) break;
         if (Clock::now() >= ss.deadline) break;
         // Found a forced mate — no need to search deeper.
         if (best_score >= kMateScore - 100) break;
+    }
+    // Optional diagnostics to stderr (default off; never touches UCI stdout).
+    if (const char* dbg = std::getenv("XQAB_STATS"); dbg && dbg[0] && dbg[0] != '0') {
+        double ms = std::chrono::duration<double, std::milli>(
+                        Clock::now() - (ss.deadline - std::chrono::milliseconds(time_ms)))
+                        .count();
+        double nps = ms > 0 ? ss.nodes / (ms / 1000.0) : 0.0;
+        std::fprintf(stderr,
+                     "[xqab_stats] depth=%d nodes=%llu nps=%.0f tt_probe=%llu "
+                     "tt_hit=%llu tt_hit_rate=%.3f tt_cut=%llu tt_cut_rate=%.3f "
+                     "internal=%llu cutoffs=%llu cutoff_rate=%.3f first_cut=%llu "
+                     "first_move_cut_rate=%.3f\n",
+                     ss.depth_reached, (unsigned long long)ss.nodes, nps,
+                     (unsigned long long)ss.tt_probe, (unsigned long long)ss.tt_hit,
+                     ss.tt_probe ? (double)ss.tt_hit / ss.tt_probe : 0.0,
+                     (unsigned long long)ss.tt_cut,
+                     ss.tt_probe ? (double)ss.tt_cut / ss.tt_probe : 0.0,
+                     (unsigned long long)ss.internal, (unsigned long long)ss.cutoffs,
+                     ss.internal ? (double)ss.cutoffs / ss.internal : 0.0,
+                     (unsigned long long)ss.first_cut,
+                     ss.cutoffs ? (double)ss.first_cut / ss.cutoffs : 0.0);
     }
     return best;
 }

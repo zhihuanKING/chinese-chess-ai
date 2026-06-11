@@ -196,6 +196,7 @@ def main() -> int:
             # Stay alive across transient load/eval errors (e.g. candidate being
             # rewritten mid-read); log and retry on the next poll.
             print(f"[gate] error: {e!r} (continuing)", flush=True)
+            last_mtime = None  # retry this candidate instead of skipping it forever
             time.sleep(a.interval)
             continue
         time.sleep(a.interval)

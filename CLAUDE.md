@@ -47,5 +47,7 @@
   2. replay.py：跨进程写指针原用 threading.Lock（对多进程无效）→ 改 /dev/shm flock；add_batch 向量化；attach 不注册 resource_tracker（防 bpo-38119 worker 重启 attach 失败）。
   3. train_value_safe.py / train_sup_continue.py：--freeze-value 原先 value_loss 仍反传进 trunk、BN running stats 仍漂移 → 冻结时 loss 排除 vloss + value 头 .eval()。
   - 已验证：8 进程并发 6 万写零丢失零撕裂；冻结后 value 头 10 张量逐位不变；--smoke ALL PASS。
-- 已知未修（按优先级）：AB 引擎搜索内重复检测死代码(search.cpp do_move 不维护 seen_)、被将军仍 stand-pat、TT mate 分数未 ply 调整；eval 固定 10 开局统计功效不足；Gumbel 逐局串行非向量化；锚点评测不发 moves 历史（引擎对重复失明）。
-- 待办：等 suponly/verify 出结果 → 用修复版代码重跑 frzV/safe/rehNoFrz 三臂（旧进程跑的是修复前代码）。
+- **2026-06-10 晚 三 Agent 对抗复审通过**：S1/S2/S3 修复逐项验证正确（z/pi 对齐、视角符号、flock 互斥、镜像增广对合、冻结边界、optimizer 过滤）。复审后加固：异常丢弃在飞对局池下沉进 `SelfPlayWorker.run()` 本体（修 train_distributed.py 漏防的 P0）；run_value_safe_v2.sh 改轮询终点曲线点(step==STEPS)替代定时 kill、eval duration 8h→24h、init/ref 用只读快照 ref_coldstart_frozen.pt、秒崩检测 check_arm；eval_final.py 开局抽样加 --seed(默认777,四臂共用)；rehearse 参数 fail-fast；replay 采样去冗余锁内 copy。均带单测验证。
+- 已知未修（按优先级）：AB 引擎搜索内重复检测死代码(search.cpp do_move 不维护 seen_)、被将军仍 stand-pat、TT mate 分数未 ply 调整；replay `_sample_indices` 满buffer时锁内 O(N) 加权采样(每step阻塞worker数十ms,可优化)；attach 端无 capacity 几何校验(误配会静默写错槽)；eval_vs_ref 同 step 可能写重复行(画图前需按 step 去重)；Gumbel 逐局串行非向量化；锚点评测不发 moves 历史（引擎对重复失明）。
+- **2026-06-11 凌晨 四臂重跑完成（修复版代码，run_value_safe_v2.sh，21:48→06:22 共8.5h）**：100局终点定论 vs 冻结冷启动（ref_coldstart_frozen.pt，n_sim=80，同开局种子777）——**safe 85.0%(+301 Elo, CI[207,396]) > rehNoFrz 82.0%(+263, CI[176,351]) > frzV 68.5%(+135, CI[62,208]) > suponly 61.0%(+78, CI[8,147])**，四臂全部显著胜冷启动（CI 均不含0），step-0 曲线点恰为 0.500 通过对称性自检。**结论反转：管线 bug 修复后 RL 真实有效**——纯自对弈 frzV 从修复前 −301 翻到 +135；safe/rehNoFrz 的 CI 与 suponly 不重叠（自对弈增益显著超纯蒸馏）；safe vs rehNoFrz 差距在 CI 内不可分。修复前旧结论作废。曲线 logs/vsafe2_*_vs_cold.csv，定论 logs/vsafe2_final_*.csv，ckpt checkpoints_vsafe2_*/。
+- 待办：报告 §7 需用新四臂结果重写（旧"RL退化"负结果叙事作废）；可选追加 safe vs rehNoFrz 直接对弈加大样本分胜负；新冠军(safe)可接锚点评测(Pikafish/AB)看绝对强度变化。

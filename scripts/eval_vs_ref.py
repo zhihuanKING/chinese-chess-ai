@@ -80,6 +80,9 @@ def main():
                 del curP_net; torch.cuda.empty_cache()
         except Exception as e:
             print(f"[vs_ref] eval err: {e}", flush=True)
+            last_mtime = None  # retry this checkpoint next round instead of
+            # dropping the point forever (fatal for the FINAL export, whose
+            # mtime never changes again)
         time.sleep(a.interval)
     f.close()
 

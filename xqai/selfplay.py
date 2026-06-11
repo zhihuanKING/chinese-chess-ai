@@ -154,6 +154,20 @@ class SelfPlayWorker:
         Returns a stats dict; samples are written to ``self.replay`` if set,
         otherwise collected and returned under ``"samples"``.
         """
+        try:
+            return self._run_impl(num_games)
+        except Exception:
+            # An exception mid-round can leave an in-flight Position with
+            # un-popped moves (PUCT pushes onto the real board before
+            # evaluating): that game's board and recorded samples would
+            # silently diverge for the rest of the game. Drop the whole
+            # in-flight pool -- losing unfinished games is cheap, corrupted
+            # labels are not. Done here (not in callers) so every caller is
+            # safe by construction.
+            self._games = None
+            raise
+
+    def _run_impl(self, num_games: int | None) -> dict[str, Any]:
         target = self.parallel_games if num_games is None else int(num_games)
 
         if self._games is None:

@@ -307,12 +307,20 @@ class ReplayBuffer:
         """
         # Index selection AND the gather both run under the cross-process lock:
         # without it a worker can overwrite the very slots being gathered
-        # (ring-wrap), yielding torn samples (new planes with old pi/z).
+        # (ring-wrap), yielding torn samples (new planes with old pi/z). Only
+        # the fp16 gathers stay inside the lock; the fp32 casts (the expensive
+        # part, ~2x the copy cost) run outside so workers aren't blocked.
+        # NOTE: ``idx`` is an index *array*, so fancy indexing already returns
+        # a fresh array detached from the shared-memory buffer -- do not turn
+        # these into slices (a slice would be a live view escaping the lock).
         with self._lock:
             idx = self._sample_indices(batch)
-            planes = self.planes[idx].astype(np.float32)        # [B,15,10,9]
-            pi = self.pi[idx].astype(np.float32)                # [B,8100]
-            z = self.z[idx].astype(np.float32)                  # [B]
+            planes16 = self.planes[idx]                         # [B,15,10,9] fp16
+            pi16 = self.pi[idx]                                 # [B,8100] fp16
+            z8 = self.z[idx]                                    # [B] int8
+        planes = planes16.astype(np.float32)
+        pi = pi16.astype(np.float32)
+        z = z8.astype(np.float32)
 
         if self.mirror_augment:
             flip = self._rng.random(batch) < 0.5

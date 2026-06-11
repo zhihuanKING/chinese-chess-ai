@@ -152,7 +152,8 @@ def _read_ckpt_size(path: str, default_channels: int, default_blocks: int) -> tu
 # --------------------------------------------------------------------------- #
 def worker_main(wid: int, gpu_id: int, cfg_dict: dict, ckpt_path: str,
                 replay_name: str, replay_capacity: int, stop_evt,
-                poll_secs: float, status, games_per_chunk: int) -> None:
+                poll_secs: float, status, games_per_chunk: int,
+                seed_salt: int = 0) -> None:
     """One self-play worker. Runs until ``stop_evt`` is set.
 
     ``status`` is a shared dict (Manager) used by the learner/smoke check to
@@ -198,7 +199,7 @@ def worker_main(wid: int, gpu_id: int, cfg_dict: dict, ckpt_path: str,
                 capacity=replay_capacity, name=replay_name, create=False,
                 recent_weight=cfg_dict["replay"]["recent_weight"],
                 mirror_augment=cfg_dict["replay"]["mirror_augment"],
-                seed=1000 + wid,
+                seed=1000 + wid + seed_salt,
             )
             break
         except FileNotFoundError:
@@ -215,7 +216,7 @@ def worker_main(wid: int, gpu_id: int, cfg_dict: dict, ckpt_path: str,
             c_puct=mcts_cfg["c_puct"],
             gumbel_m=mcts_cfg.get("gumbel_m", 16),
             virtual_loss=mcts_cfg["virtual_loss"],
-            seed=2000 + wid,
+            seed=2000 + wid + seed_salt,
         )
     else:
         planner = PUCTPlanner(
@@ -223,7 +224,7 @@ def worker_main(wid: int, gpu_id: int, cfg_dict: dict, ckpt_path: str,
             dirichlet_alpha=mcts_cfg["dirichlet_alpha"],
             dirichlet_eps=mcts_cfg["dirichlet_eps"],
             virtual_loss=mcts_cfg["virtual_loss"],
-            seed=2000 + wid,
+            seed=2000 + wid + seed_salt,
         )
     sp = SelfPlayWorker(
         net=model, planner=planner, replay=replay,
@@ -232,7 +233,7 @@ def worker_main(wid: int, gpu_id: int, cfg_dict: dict, ckpt_path: str,
         temp_moves=sp_cfg["temp_moves"],
         resign_threshold=sp_cfg["resign_threshold"],
         max_plies=sp_cfg.get("max_plies", 400),
-        seed=3000 + wid,
+        seed=3000 + wid + seed_salt,
     )
 
     last_mtime = 0.0
@@ -280,6 +281,8 @@ def worker_main(wid: int, gpu_id: int, cfg_dict: dict, ckpt_path: str,
             status[f"w{wid}_buf"] = len(replay)
         except Exception as exc:  # keep the worker alive across transient errors
             status[f"w{wid}_error"] = repr(exc)
+            # run() drops its in-flight game pool itself on exception, so the
+            # next call starts from fresh positions -- no divergence risk here.
             time.sleep(0.5)
         if time.time() >= next_poll:
             maybe_reload()
@@ -301,11 +304,12 @@ class WorkerSpec:
 
 
 def _spawn_worker(ctx, spec, cfg_dict, ckpt_path, replay_name, replay_capacity,
-                  stop_evt, poll_secs, status, games_per_chunk):
+                  stop_evt, poll_secs, status, games_per_chunk, seed_salt=0):
     p = ctx.Process(
         target=worker_main,
         args=(spec.wid, spec.gpu_id, cfg_dict, ckpt_path, replay_name,
-              replay_capacity, stop_evt, poll_secs, status, games_per_chunk),
+              replay_capacity, stop_evt, poll_secs, status, games_per_chunk,
+              seed_salt),
         daemon=False,
         name=f"sp-worker-{spec.wid}",
     )
@@ -483,6 +487,20 @@ def main() -> int:
               f"only trunk+policy train", flush=True)
 
     # ---- supervised rehearsal pool (value/policy anchor) ---------------- #
+    # Fail fast on a half-specified rehearsal: --rehearse-frac without
+    # --rehearse-dir would otherwise silently train with 0% rehearsal and
+    # swap the arm's meaning (rehNoFrz would degenerate into plain v2).
+    if args.rehearse_frac > 0 and not args.rehearse_dir:
+        print("[learner] FATAL: --rehearse-frac > 0 requires --rehearse-dir. "
+              "Aborting.", flush=True)
+        return 4
+    if not (0.0 <= args.rehearse_frac < 1.0):
+        print(f"[learner] FATAL: --rehearse-frac must be in [0, 1), got "
+              f"{args.rehearse_frac}. Aborting.", flush=True)
+        return 4
+    if args.rehearse_dir and args.rehearse_frac == 0:
+        print("[learner] WARNING: --rehearse-dir given but --rehearse-frac=0 "
+              "-> rehearsal is OFF", flush=True)
     sup_pool = None
     if args.rehearse_dir and args.rehearse_frac > 0:
         sup_pool = SupervisedPool(args.rehearse_dir, args.rehearse_shards, seed=11)
@@ -533,6 +551,7 @@ def main() -> int:
     # Workers poll the CHAMPION (best.pt), not the candidate (latest.pt): only
     # gate-promoted weights are ever fed back into self-play.
     procs: dict[int, mp.Process] = {}
+    restarts: dict[int, int] = {}
     for spec in specs:
         procs[spec.wid] = _spawn_worker(ctx, spec, cfg_d, best_path, replay_name,
                                         capacity, stop_evt, poll_secs, status,
@@ -566,16 +585,21 @@ def main() -> int:
             if time_budget is not None and (time.time() - t_start) >= time_budget:
                 break
 
-            # Restart any dead workers.
+            # Restart any dead workers. Salt the RNG seeds per incarnation:
+            # with identical seeds + a frozen champion, a restarted worker
+            # would replay its first life's game stream and double-feed
+            # near-duplicate samples into the buffer.
             for spec in specs:
                 p = procs[spec.wid]
                 if not p.is_alive() and p.exitcode is not None and not stop_evt.is_set():
                     if not status.get(f"w{spec.wid}_exited"):
+                        restarts[spec.wid] = restarts.get(spec.wid, 0) + 1
                         print(f"[learner] worker {spec.wid} died (exit={p.exitcode}); "
-                              f"restarting", flush=True)
+                              f"restarting (incarnation {restarts[spec.wid]})", flush=True)
                         procs[spec.wid] = _spawn_worker(
                             ctx, spec, cfg_d, best_path, replay_name, capacity,
-                            stop_evt, poll_secs, status, games_per_chunk)
+                            stop_evt, poll_secs, status, games_per_chunk,
+                            seed_salt=10000 * restarts[spec.wid])
 
             buf_now = len(replay)
             if buf_now < min_buffer:

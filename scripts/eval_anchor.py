@@ -178,6 +178,8 @@ def main():
     ap.add_argument("--max-plies", type=int, default=300)
     ap.add_argument("--out", default="logs/anchor_ladder.csv")
     ap.add_argument("--tag", default="")
+    ap.add_argument("--opening-seed", type=int, default=12345,
+                    help="开局池种子;分片并行评测时各分片必须给不同值,否则对弈重复、样本造假")
     a = ap.parse_args()
 
     dev = f"cuda:{a.gpu}"
@@ -185,7 +187,7 @@ def main():
     planner = PUCTPlanner(add_noise=False)
     netP = arena.NetPlayer(net, planner, n_sim=a.n_sim, name=f"net_n{a.n_sim}")
     opp, closable = build_opponent(a.opponent, a.gpu, n_sim=a.n_sim)
-    ops = make_openings(max(a.games // 2 + 2, 12))
+    ops = make_openings(max(a.games // 2 + 2, 12), seed=a.opening_seed)
 
     t0 = time.time()
     r = arena.play_match(netP, opp, games=a.games, openings=ops, max_plies=a.max_plies)

@@ -1,0 +1,54 @@
+# 中国象棋 AI 全局配置（方案B max-scale：榨干硬件，看学习型能到什么地步）
+network:
+  channels: 256          # B 主力 256×15（~41M，40GB卡无压力）
+  blocks: 15
+  num_planes: 15
+  action_dim: 8100       # from*90+to；2086 紧凑编码作消融
+
+mcts:
+  planner: gumbel        # B 用 Gumbel-AlphaZero（低模拟保证策略改进，项目核心算法）
+  n_sim_selfplay: 128   # B循环: 4x改进算子强度(原32)     # Gumbel 16~32
+  n_sim_eval: 800        # 评估给足搜索（grid 证明网络吃搜索）
+  c_puct: 1.5
+  dirichlet_alpha: 0.2
+  dirichlet_eps: 0.25
+  virtual_loss: 3
+  gumbel_m: 16           # Gumbel 候选数
+  playout_cap_frac: 0.25 # KataGo playout cap randomization
+
+data:                    # v2 监督数据质量（gen_pikafish_data.py 软标签）
+  gen_depth: 14          # Pikafish 教师搜索深度（时间不限→抬高天花板）
+  multipv: 8             # MultiPV：>1 启用软策略标签（top-k）
+  policy_temp: 100       # 软策略 softmax(cp/temp)（cp）
+  value_scale: 500       # 价值 tanh(cp/scale)（cp）；连续引擎评估，替代纯终局结果
+
+selfplay:
+  parallel_games: 256    # 单 worker 并行对局
+  workers_per_gpu: 4     # 每卡 5 worker（榨干 192 核 CPU）
+  temp_moves: 30         # 开局前 N 步温度=1
+  resign_threshold: null # 禁用认输：冷启动 value 过自信会过早认输→z 错误→退化
+
+train:
+  batch_size: 4096       # 大 batch
+  lr_supervised: 1.0e-3
+  lr_rl: 0.001           # 冷启动微调用低 lr（0.02 会灾难性遗忘）
+  weight_decay: 1.0e-4
+  precision: bf16
+  export_every: 800      # 每 K 步导出 candidate
+  gating_games: 100
+  gating_winrate: 0.55
+
+replay:
+  capacity: 5000000      # /dev/shm 5e6 局面（1TB 内存够）
+  dir: /dev/shm/xqai_replay
+  recent_weight: true
+  mirror_augment: true
+
+distributed:
+  learner_gpus: [0]          # GPU0 learner
+  selfplay_gpus: [1, 2, 3, 4, 5, 6]  # 6 卡自对弈，GPU7 留给评估
+
+paths:
+  data: /mnt/nvme3n1/gameTheory/data
+  checkpoints: /mnt/nvme3n1/gameTheory/checkpoints_b
+  logs: /mnt/nvme3n1/gameTheory/logs

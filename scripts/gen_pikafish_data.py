@@ -213,9 +213,11 @@ class PikafishEngine:
     _INFO_RE = re.compile(
         r"depth (\d+).*?multipv (\d+).*?score (cp|mate) (-?\d+).*? pv (\S+)")
 
-    def analyse(self, moves: List[str], depth: Optional[int] = None,
-                movetime: Optional[int] = None, timeout: float = 30.0):
-        """MultiPV analysis of the position after ``moves``.
+    def analyse(self, moves: Optional[List[str]] = None,
+                depth: Optional[int] = None,
+                movetime: Optional[int] = None, timeout: float = 30.0,
+                *, fen: Optional[str] = None):
+        """MultiPV analysis of the position after ``moves`` (or at ``fen``).
 
         Returns ``(ordered, root_cp)`` where ``ordered`` is
         ``[(move_uci, cp), ...]`` for multipv 1..k (deepest completed line per
@@ -223,8 +225,15 @@ class PikafishEngine:
         best line's score. Mate scores are mapped to large signed cp so they
         squash to ~±1 value and dominate the policy softmax. Requires the engine
         to have been started with ``multipv > 1``.
+
+        ``fen``: analyse an arbitrary position via ``position fen ...`` instead
+        of a startpos move list. NOTE Pikafish FENs use n(马)/b(象); translate
+        our Position.fen() with ``str.maketrans("heHE", "nbNB")`` first (the
+        coordinate *move* notation is identical either way).
         """
-        if moves:
+        if fen is not None:
+            self._send(f"position fen {fen}")
+        elif moves:
             self._send("position startpos moves " + " ".join(moves))
         else:
             self._send("position startpos")

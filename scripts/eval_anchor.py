@@ -10,7 +10,7 @@ Pikafish 是 **UCI** 引擎(非 UCCI),且 FEN 棋子字母用 n(马)/b(象),
 单次只跑一对(--opponent),多对用 shell 并行铺到多卡。
 """
 from __future__ import annotations
-import argparse, csv, os, subprocess, threading, time
+import argparse, csv, json, os, subprocess, threading, time
 import numpy as np, torch
 
 from xqai.network import PVNet
@@ -84,9 +84,18 @@ class PikafishUCIPlayer:
     def reset(self):
         self._send("ucinewgame")
 
-    def select_move(self, pos):
-        fen = pos.fen().translate(_TRANS)
-        self._send(f"position fen {fen}")
+    # arena._play_game 看到此标志后会传 (start_fen, moves) —— 引擎拿到完整着法
+    # 历史,重复检测/避重才生效。
+    wants_moves = True
+
+    def select_move(self, pos, start_fen=None, moves=None):
+        # 只翻译 FEN 里的棋子字母 h/e -> n/b(Pikafish 记谱);着法串是坐标格式
+        # (列 a..i + 行 0..9),其中 'h'/'e' 是列字母,绝不能翻译。
+        fen = (start_fen if start_fen else pos.fen()).translate(_TRANS)
+        cmd = f"position fen {fen}"
+        if start_fen and moves:
+            cmd += " moves " + " ".join(moves)
+        self._send(cmd)
         if self.depth is not None:
             self._send(f"go depth {self.depth}")
         else:
@@ -178,6 +187,8 @@ def main():
     ap.add_argument("--max-plies", type=int, default=300)
     ap.add_argument("--out", default="logs/anchor_ladder.csv")
     ap.add_argument("--tag", default="")
+    ap.add_argument("--dump-games", default="",
+                    help="每局追加一行 JSON(开局FEN/着法/红方视角结果/net执色),DAgger 标注原料")
     ap.add_argument("--opening-seed", type=int, default=12345,
                     help="开局池种子;分片并行评测时各分片必须给不同值,否则对弈重复、样本造假")
     a = ap.parse_args()
@@ -195,6 +206,22 @@ def main():
     if closable is not None:
         try: closable.close()
         except Exception: pass
+
+    if a.dump_games:
+        d = os.path.dirname(a.dump_games)
+        if d:
+            os.makedirs(d, exist_ok=True)
+        with open(a.dump_games, "a") as f:
+            for g in r["game_records"]:
+                # play_match(netP, opp): player_a 恒为 net, a_is_red 即 net 执红。
+                f.write(json.dumps({
+                    "opening_fen": g["opening_fen"],
+                    "moves": g["moves"],
+                    "result": g["result"],  # 红方视角 ±1/0
+                    "net_side": "red" if g["a_is_red"] else "black",
+                    "opponent": a.opponent,
+                    "tag": a.tag,
+                }) + "\n")
 
     wr = r["a_score_rate"]; lo, hi = r["ci95"]
     elo = arena.elo_from_winrate(wr)

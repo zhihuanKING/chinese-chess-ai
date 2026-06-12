@@ -131,8 +131,16 @@ class SubprocessUCCIPlayer:
                 return line
         return ""
 
-    def select_move(self, pos) -> int:
-        self._send(f"position fen {pos.fen()}")
+    #: arena._play_game sees this and passes (start_fen, moves) so the engine
+    #: gets the full move history -> its repetition detection actually works.
+    wants_moves = True
+
+    def select_move(self, pos, start_fen: str | None = None,
+                    moves: list[str] | None = None) -> int:
+        cmd = f"position fen {start_fen if start_fen else pos.fen()}"
+        if start_fen and moves:
+            cmd += " moves " + " ".join(moves)
+        self._send(cmd)
         if self.depth is not None:
             self._send(f"go depth {self.depth}")
         else:
@@ -196,27 +204,50 @@ def _ucci_to_move(ucci: str) -> int:
     return f * 90 + t
 
 
+def move_to_ucci(move: int) -> str:
+    """Inverse of :func:`_ucci_to_move` (``from*90+to`` -> e.g. ``h2e2``)."""
+    f, t = divmod(int(move), 90)
+    fr, fc = divmod(f, 9)
+    tr, tc = divmod(t, 9)
+    return f"{chr(ord('a') + fc)}{9 - fr}{chr(ord('a') + tc)}{9 - tr}"
+
+
 # --------------------------------------------------------------------------- #
 # Match runner                                                                #
 # --------------------------------------------------------------------------- #
 def _play_game(red_player: "Player", black_player: "Player", *, opening_fen: str | None,
-               max_plies: int = 400) -> int:
-    """Play one game; return result code (RED_WIN / BLACK_WIN / DRAW)."""
+               max_plies: int = 400) -> tuple[int, dict]:
+    """Play one game; return ``(result_code, record)``.
+
+    ``record`` has the opening FEN and the UCCI move list actually played, so
+    callers can dump games for later analysis/labelling. Players that set
+    ``wants_moves = True`` receive ``select_move(pos, start_fen=..., moves=...)``
+    (UCCI history since the opening) so external engines can be fed
+    ``position fen <opening> moves <m1> <m2> ...`` and keep repetition state.
+    """
     pos = _position_from_fen(opening_fen) if opening_fen else _new_position()
+    start_fen = pos.fen()
+    moves_ucci: list[str] = []
+    record = {"opening_fen": start_fen, "moves": moves_ucci}
     red_player.reset()
     black_player.reset()
     for _ in range(max_plies):
         res = pos.result()
         if res != _ONGOING:
-            return res
+            return res, record
         player = red_player if pos.side_to_move() == 0 else black_player
-        move = player.select_move(pos)
+        if getattr(player, "wants_moves", False):
+            move = player.select_move(pos, start_fen=start_fen, moves=moves_ucci)
+        else:
+            move = player.select_move(pos)
         legal = pos.legal_moves()
         if move not in legal:
             # Illegal move => the mover forfeits.
-            return _BLACK_WIN if pos.side_to_move() == 0 else _RED_WIN
+            res = _BLACK_WIN if pos.side_to_move() == 0 else _RED_WIN
+            return res, record
+        moves_ucci.append(move_to_ucci(move))
         pos.push(move)
-    return _DRAW
+    return _DRAW, record
 
 
 def wilson_interval(wins: float, n: int, z: float = 1.96) -> tuple[float, float]:
@@ -253,16 +284,21 @@ def play_match(player_a: "Player", player_b: "Player", *, games: int = 100,
 
     a_wins = a_draws = a_losses = 0
     played = 0
+    game_records: list[dict] = []
     for op in op_list:
         for swap in (False, True):  # A=red then A=black (paired)
             if played >= games:
                 break
             if not swap:
-                res = _play_game(player_a, player_b, opening_fen=op, max_plies=max_plies)
+                res, rec = _play_game(player_a, player_b, opening_fen=op, max_plies=max_plies)
                 a_is_red = True
             else:
-                res = _play_game(player_b, player_a, opening_fen=op, max_plies=max_plies)
+                res, rec = _play_game(player_b, player_a, opening_fen=op, max_plies=max_plies)
                 a_is_red = False
+            # Result from RED's perspective: +1 red win / -1 black win / 0 draw.
+            rec["result"] = 1 if res == _RED_WIN else (-1 if res == _BLACK_WIN else 0)
+            rec["a_is_red"] = a_is_red
+            game_records.append(rec)
             played += 1
             if res == _DRAW:
                 a_draws += 1
@@ -284,12 +320,14 @@ def play_match(player_a: "Player", player_b: "Player", *, games: int = 100,
         "a_score_rate": rate,
         "ci95": (lo, hi),
         "elo_diff": elo_from_winrate(rate),
+        "game_records": game_records,
     }
 
 
 __all__ = [
     "NetPlayer",
     "SubprocessUCCIPlayer",
+    "move_to_ucci",
     "play_match",
     "wilson_interval",
     "elo_from_winrate",

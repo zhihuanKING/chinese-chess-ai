@@ -73,10 +73,22 @@ class SupervisedPool:
         pl, pis, zs = [], [], []
         for f in files:
             d = np.load(f)
-            if "pi" not in d.files:
-                continue  # require dense soft labels (v2 format)
+            if "pi" in d.files:
+                pi = np.asarray(d["pi"], dtype=np.float32)
+            elif "pi_idx" in d.files and "pi_val" in d.files:
+                # DAgger labeled shards (label_service.py): sparse top-k,
+                # 0-padded (val=0). Scatter to dense for uniform sampling.
+                idx = np.asarray(d["pi_idx"], dtype=np.int64)
+                val = np.asarray(d["pi_val"], dtype=np.float32)
+                n, k = idx.shape
+                pi = np.zeros((n, 8100), dtype=np.float32)
+                rows = np.repeat(np.arange(n), k)
+                flat_idx, flat_val = idx.reshape(-1), val.reshape(-1)
+                keep = flat_val > 0
+                pi[rows[keep], flat_idx[keep]] = flat_val[keep]
+            else:
+                continue  # unknown shard format
             pl.append(np.asarray(d["planes"], dtype=np.float16))
-            pi = np.asarray(d["pi"], dtype=np.float32)
             s = pi.sum(1, keepdims=True); s[s == 0] = 1.0; pi /= s
             pis.append(pi.astype(np.float16))
             zs.append(np.asarray(d["z"], dtype=np.float16))

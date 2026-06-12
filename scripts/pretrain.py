@@ -156,14 +156,29 @@ class FlatDataset(Dataset):
     OS page cache — random shuffle over 5M samples no longer balloons RAM.
     """
 
-    def __init__(self, data_dir: str):
+    def __init__(self, data_dir: str, z_file: str | None = None,
+                 pi_val_file: str | None = None):
         j = lambda n: os.path.join(data_dir, n)
+
+        def resolve(p: str) -> str:
+            # 允许绝对路径，或相对 data_dir 的文件名(如 z_wdl.npy / pi_val_T50.npy)
+            return p if os.path.isabs(p) or os.path.exists(p) else j(p)
+
         self.planes = np.load(j("planes.npy"), mmap_mode="r")
         self.pi_idx = np.load(j("pi_idx.npy"), mmap_mode="r")
-        self.pi_val = np.load(j("pi_val.npy"), mmap_mode="r")
-        self.z = np.load(j("z.npy"), mmap_mode="r")
+        pv_path = resolve(pi_val_file) if pi_val_file else j("pi_val.npy")
+        z_path = resolve(z_file) if z_file else j("z.npy")
+        self.pi_val = np.load(pv_path, mmap_mode="r")
+        self.z = np.load(z_path, mmap_mode="r")
         self._n = int(self.planes.shape[0])
+        if self.z.shape[0] != self._n or self.pi_val.shape != self.pi_idx.shape:
+            raise ValueError(
+                f"label override shape mismatch: planes N={self._n}, "
+                f"z={self.z.shape} ({z_path}), pi_val={self.pi_val.shape} ({pv_path})")
         self.files = [j("planes.npy")]  # for logging parity with ShardDataset
+        if _rank() == 0:
+            print(f"[pretrain] FlatDataset labels: z={z_path} pi_val={pv_path}",
+                  flush=True)
 
     def __len__(self) -> int:
         return self._n
@@ -187,10 +202,14 @@ class FlatDataset(Dataset):
         )
 
 
-def make_dataset(data_dir: str):
+def make_dataset(data_dir: str, z_file: str | None = None,
+                 pi_val_file: str | None = None):
     """Pick FlatDataset when a flat memmap store exists, else sharded npz."""
     if os.path.exists(os.path.join(data_dir, "planes.npy")):
-        return FlatDataset(data_dir)
+        return FlatDataset(data_dir, z_file=z_file, pi_val_file=pi_val_file)
+    if z_file or pi_val_file:
+        raise ValueError("--z-file/--pi-val-file 仅支持 flat memmap 数据集 "
+                         f"(未在 {data_dir} 找到 planes.npy)")
     return ShardDataset(data_dir)
 
 
@@ -288,7 +307,24 @@ def main() -> int:
     ap.add_argument("--log-every", type=int, default=50)
     ap.add_argument("--save-every", type=int, default=0,
                     help="每 N 步存一个带 step 标记的 checkpoint(0=关);用于细粒度监督学习曲线")
+    ap.add_argument("--z-file", default=None,
+                    help="覆盖 value 标签(flat 数据集): 绝对路径或相对 --data 的 "
+                         "文件名,如 z_wdl.npy;默认 z.npy")
+    ap.add_argument("--pi-val-file", default=None,
+                    help="覆盖 policy 标签值(flat 数据集): 如 pi_val_T50.npy;"
+                         "默认 pi_val.npy")
+    ap.add_argument("--max-steps", type=int, default=0,
+                    help="最多训练 N 个 step 后提前结束(0=关)")
+    ap.add_argument("--init", default=None,
+                    help="从已有 checkpoint 续训(加载 model 权重;channels/blocks "
+                         "以 ckpt 为准覆盖命令行)。续训建议配小 lr(如 1e-4)")
+    ap.add_argument("--smoke", action="store_true",
+                    help="冒烟模式: 等价 --epochs 1 --max-steps 50,不存 checkpoint")
     args = ap.parse_args()
+    if args.smoke:
+        args.epochs = 1
+        args.max_steps = args.max_steps or 50
+        args.save_every = 0
 
     # ---- DDP init (only when launched under torchrun) -------------------- #
     use_ddp = args.gpus > 1 and "RANK" in os.environ
@@ -311,7 +347,7 @@ def main() -> int:
     world = _world_size()
 
     # ---- data ------------------------------------------------------------ #
-    ds = make_dataset(args.data)
+    ds = make_dataset(args.data, z_file=args.z_file, pi_val_file=args.pi_val_file)
     if use_ddp:
         sampler = DistributedSampler(ds, num_replicas=world, rank=rank, shuffle=True)
         loader = DataLoader(
@@ -331,7 +367,18 @@ def main() -> int:
               flush=True)
 
     # ---- model / optim --------------------------------------------------- #
+    if args.init:
+        ck = torch.load(args.init, map_location="cpu", weights_only=False)
+        args.channels = int(ck.get("channels", args.channels))
+        args.blocks = int(ck.get("blocks", args.blocks))
+        if rank == 0:
+            print(f"[pretrain] init from {args.init} "
+                  f"({args.channels}x{args.blocks}, step={ck.get('step', '?')})",
+                  flush=True)
     model = PVNet(channels=args.channels, blocks=args.blocks).to(device)
+    if args.init:
+        model.load_state_dict(ck["model"])
+        del ck
     raw_model = model
     if use_ddp:
         model = nn.parallel.DistributedDataParallel(model, device_ids=[device.index])
@@ -400,9 +447,14 @@ def main() -> int:
                 torch.save({"model": raw_model.state_dict(), "channels": args.channels,
                             "blocks": args.blocks, "step": global_step}, _tmp)
                 os.replace(_tmp, _sp)
+            if args.max_steps and global_step >= args.max_steps:
+                break
 
         # ---- epoch end: checkpoint + diagnostics (rank 0 only) ----------- #
-        if rank == 0:
+        if rank == 0 and args.smoke:
+            print(f"[pretrain] smoke OK: {ep_n} steps avg_loss="
+                  f"{ep_loss / max(ep_n, 1):.4f}", flush=True)
+        elif rank == 0:
             avg = ep_loss / max(ep_n, 1)
             top1 = diag_top1(raw_model, diag, device)
             dt = time.time() - t0
@@ -430,6 +482,8 @@ def main() -> int:
             )
             os.replace(tmp, best)
             print(f"[pretrain] wrote {ckpt} and {best}", flush=True)
+        if args.max_steps and global_step >= args.max_steps:
+            break
 
     if use_ddp:
         dist.barrier()

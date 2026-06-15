@@ -81,6 +81,41 @@ def _make_openings(n_pairs: int, seed: int = 12345) -> list[str]:
     return openings
 
 
+def _ext_eval(ckpt: str, gpu: int, parallel: int,
+              anchors=("xqab:200", "pikafish:1"), games: int = 64) -> dict:
+    """External-anchor score of ``ckpt``: combined score-rate over anchors.
+
+    Runs scripts/eval_anchor_vec.py as a subprocess per anchor (battle-tested
+    path, fixed opening seed 12345 so candidate-vs-champion comparisons are on
+    the same opening set). Returns {"combined": float, anchor: wr, ...}.
+    """
+    import csv as _csv
+    import subprocess as _sp
+    out = {}
+    tot_w = tot_n = 0.0
+    for opp in anchors:
+        tag = "extgate_" + opp.replace(":", "")
+        tmp = f"/tmp/extgate_{os.getpid()}_{tag}.csv"
+        if os.path.exists(tmp):
+            os.remove(tmp)
+        cmd = [sys.executable, os.path.join(_ROOT, "scripts/eval_anchor_vec.py"),
+               "--ckpt", ckpt, "--opponent", opp, "--gpu", str(gpu),
+               "--n-sim", "200", "--games", str(games), "--parallel", str(parallel),
+               "--opening-seed", "12345", "--tag", tag, "--out", tmp]
+        # 必须限 intra-op 线程:不限的话 torch 默认抢满全部核,会把同机 24 个
+        # 自对弈 worker 的 MCTS 饿死(实测 buffer 填充掉到 1/4 速)。
+        env = {**os.environ, "OMP_NUM_THREADS": "4", "MKL_NUM_THREADS": "4"}
+        _sp.run(cmd, check=True, capture_output=True, timeout=3600, env=env)
+        with open(tmp) as fh:
+            row = list(_csv.DictReader(fh))[-1]
+        wr = float(row["winrate"]); n = int(row["games"])
+        out[opp] = wr
+        tot_w += wr * n; tot_n += n
+        os.remove(tmp)
+    out["combined"] = tot_w / max(tot_n, 1)
+    return out
+
+
 def _atomic_promote(candidate_path: str, champion_path: str) -> None:
     """Replace champion with the candidate's bytes, atomically (tmp + os.replace).
 
@@ -116,6 +151,14 @@ def main() -> int:
     ap.add_argument("--interval", type=float, default=30.0,
                     help="poll period for candidate mtime changes")
     ap.add_argument("--ladder", default=os.path.join(logs_dir, "elo_ladder.csv"))
+    ap.add_argument("--parallel", type=int, default=12,
+                    help="向量化对局并行数(>1 用 arena_vec, ~7x;1=旧串行路径)")
+    ap.add_argument("--ext-gate", action="store_true",
+                    help="外部锚点门控:候选 vs AB200+pf1 合并分超过冠军基线才晋升"
+                         "(净化 net-vs-net 对老师的通缩偏差)")
+    ap.add_argument("--ext-games", type=int, default=64, help="外部门控每锚点局数")
+    ap.add_argument("--ext-margin", type=float, default=0.01,
+                    help="外部合并分需超出冠军基线的余量(抗噪声)")
     a = ap.parse_args()
 
     dev = a.device if torch.cuda.is_available() else "cpu"
@@ -153,6 +196,12 @@ def main() -> int:
                 continue
             last_mtime = mt
 
+            # 快照候选:评测要几十分钟而 learner 每 export_every 步就覆盖
+            # latest.pt——不快照的话"晋升的权重 ≠ 被评测的权重"(已实测踩坑:
+            # 评的 step-0,promote 时文件已是 step-800)。评测与晋升一律用快照。
+            cand_snap = a.candidate + ".gate_eval_snapshot"
+            shutil.copyfile(a.candidate, cand_snap)
+
             if not os.path.exists(a.champion):
                 # No champion yet -> the candidate becomes champion by default
                 # (mirrors the learner's best.pt seeding; keeps workers fed).
@@ -165,13 +214,64 @@ def main() -> int:
                 lf.flush()
                 continue
 
+            if a.ext_gate:
+                # External-anchor gating (净化版判据): net-vs-net 对老师存在系统性
+                # "通缩"(候选外部持平却 head-to-head 38%,见 2026-06-12 实测),
+                # 0.55 头对头门槛会永久拒绝外部更强/持平的候选。这里直接用外部
+                # 锚点合并分(AB200+pf1 各 ext_games 局)对比冠军基线,真棋力说了算。
+                import json as _json
+                gpu_idx = int(a.device.split(":")[-1]) if ":" in a.device else 0
+                cand_step = _safe_step(a.candidate)
+                champ_step = _safe_step(a.champion)
+                cache_path = a.ladder + ".champ_ext.json"
+                base = None
+                if os.path.exists(cache_path):
+                    with open(cache_path) as fh:
+                        base = _json.load(fh)
+                if not base or base.get("champ_step") != champ_step:
+                    cb = _ext_eval(a.champion, gpu_idx, a.parallel, games=a.ext_games)
+                    base = {"champ_step": champ_step, **cb}
+                    with open(cache_path, "w") as fh:
+                        _json.dump(base, fh)
+                    print(f"[gate] champion ext baseline step={champ_step}: "
+                          f"{ {k: round(v,3) for k,v in cb.items()} }", flush=True)
+                ce = _ext_eval(a.candidate, gpu_idx, a.parallel, games=a.ext_games)
+                wr = ce["combined"]
+                promote = wr >= base["combined"] + a.ext_margin
+                tagline = (f"cand_step={cand_step} ext={wr:.3f} "
+                           f"{ {k: round(v,3) for k,v in ce.items() if k!='combined'} } "
+                           f"vs champ_ext={base['combined']:.3f} (step={champ_step})")
+                if promote:
+                    _atomic_promote(a.candidate, a.champion)
+                    version += 1
+                    # 赢者诅咒修正:候选是带着(可能偏高的)获胜测量上位的,直接拿它
+                    # 当基线会把门槛棘轮式抬高。删缓存 -> 下轮对新冠军独立重测,
+                    # 基线无偏。
+                    if os.path.exists(cache_path):
+                        os.remove(cache_path)
+                    lw.writerow([int(time.time()), version, cand_step,
+                                 f"{wr:.3f}", f"{arena.elo_from_winrate(wr):.1f}"])
+                    lf.flush()
+                    print(f"[gate] PROMOTE {tagline} -> best.pt v{version}", flush=True)
+                else:
+                    print(f"[gate] REJECT  {tagline} (champion v{version} kept)",
+                          flush=True)
+                continue
+
             cand_net, cand_step = _load_net(a.candidate, dev)
             champ_net, champ_step = _load_net(a.champion, dev)
 
-            candP = arena.NetPlayer(cand_net, planner, n_sim=a.n_sim, name="candidate")
-            champP = arena.NetPlayer(champ_net, planner, n_sim=a.n_sim, name="champion")
-
-            r = arena.play_match(candP, champP, games=a.games, openings=openings)
+            if a.parallel > 1:
+                # Vectorized match (~7x): lockstep batched search per side.
+                from xqai.arena_vec import NetVecPlayer, play_match_vec
+                candP = NetVecPlayer(cand_net, planner, n_sim=a.n_sim, name="candidate")
+                champP = NetVecPlayer(champ_net, planner, n_sim=a.n_sim, name="champion")
+                r = play_match_vec(candP, champP, games=a.games,
+                                   openings=openings, parallel=a.parallel)
+            else:
+                candP = arena.NetPlayer(cand_net, planner, n_sim=a.n_sim, name="candidate")
+                champP = arena.NetPlayer(champ_net, planner, n_sim=a.n_sim, name="champion")
+                r = arena.play_match(candP, champP, games=a.games, openings=openings)
             wr = r["a_score_rate"]
             elo = arena.elo_from_winrate(wr)
             promote = wr >= a.winrate

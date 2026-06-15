@@ -31,7 +31,7 @@ selfplay:
 train:
   batch_size: 4096       # 大 batch
   lr_supervised: 1.0e-3
-  lr_rl: 0.001           # 冷启动微调用低 lr（0.02 会灾难性遗忘）
+  lr_rl: 0.0003        # B循环: 蒸馏底座更脆,1e-3会快速侵蚀教师知识(实测50%→24%)
   weight_decay: 1.0e-4
   precision: bf16
   export_every: 800      # 每 K 步导出 candidate

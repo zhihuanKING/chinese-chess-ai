@@ -5,6 +5,8 @@
 set -u
 cd /mnt/nvme3n1/gameTheory
 source .venv/bin/activate
+# 限 torch intra-op 线程,防止评测/采集抢满 192 核饿死自对弈 worker
+export OMP_NUM_THREADS=4 MKL_NUM_THREADS=4
 CHAMP=checkpoints_b/best.pt
 LCSV=logs/ladder/b_ladder.csv
 mkdir -p logs/ladder
